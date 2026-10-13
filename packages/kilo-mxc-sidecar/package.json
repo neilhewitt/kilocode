@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@kilocode/mxc-sidecar",
+  "version": "7.8.9",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "description": "Node sidecar hosting the MXC SDK behind an authenticated control channel for Kilo's Windows sandbox",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:"
+  }
+}
