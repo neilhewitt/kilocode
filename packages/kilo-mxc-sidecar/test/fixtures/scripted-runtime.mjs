@@ -10,12 +10,17 @@ function event(entry) {
 
 export function createRuntime() {
   return {
-    getPlatformSupport: async () => ({
-      isSupported: true,
-      availableMethods: ["processcontainer", "hyperlight"],
-      isolationTier: "base-container",
-      source: "scripted",
-    }),
+    getPlatformSupport: async () => {
+      event({ type: "platformSupport" })
+      const scripted = JSON.parse(process.env.KILO_MXC_SCRIPT_SUPPORT ?? "null")
+      if (scripted) return scripted
+      return {
+        isSupported: true,
+        availableMethods: ["processcontainer", "hyperlight"],
+        isolationTier: "base-container",
+        source: "scripted",
+      }
+    },
     run: async (command, bindings) => {
       event({ type: "run", command, bindings: bindings ?? {} })
       const canned = JSON.parse(process.env.KILO_MXC_SCRIPT_RESULT ?? "{}")

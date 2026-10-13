@@ -1,7 +1,7 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { spawn, spawnSync } from "node:child_process"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { lookup } from "node:dns/promises"
 import { connect } from "node:net"
 import os from "node:os"
@@ -44,6 +44,12 @@ function launch(root: string, overrides: Partial<Launch> = {}): Launch {
   }
 }
 
+function sameTree(left: string, right: string) {
+  const a = process.platform === "win32" ? left.toLowerCase() : left
+  const b = process.platform === "win32" ? right.toLowerCase() : right
+  return a === b || a.startsWith(`${b}\\`)
+}
+
 describe("mxc policy translation", () => {
   test("composes the grant table from the profile", () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-translate-"))
@@ -64,7 +70,7 @@ describe("mxc policy translation", () => {
     }
   })
 
-  test("maps denyNames onto denied paths found inside writable grants", () => {
+  test("maps denyNames onto denied paths for secret-named files, never directories", () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-deny-names-"))
     try {
       mkdirSync(path.join(root, ".git"))
@@ -72,11 +78,198 @@ describe("mxc policy translation", () => {
       mkdirSync(path.join(root, "sub"))
       writeFileSync(path.join(root, "sub", ".gitconfig"), "x")
       const request = translate(profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [".git", ".env"], temporaryDirectory: undefined } }), launch(root))
-      assert.ok(request.filesystem.deniedPaths.includes(path.join(root, ".git")), "deny-named directories are denied")
       assert.ok(request.filesystem.deniedPaths.includes(path.join(root, ".env")), "deny-named files are denied")
+      assert.ok(!request.filesystem.deniedPaths.includes(path.join(root, ".git")), "deny-named directories stay under their grant so VCS metadata keeps working")
       assert.ok(!request.filesystem.deniedPaths.some((entry) => entry.endsWith(".gitconfig")), "non-matching names are not denied")
     } finally {
       rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("composes the strictest-default readonly table from the environment", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-table-"))
+    const world = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-world-"))
+    try {
+      const home = path.join(world, "home")
+      const tools = path.join(world, "tools")
+      const under = path.join(root, "under")
+      mkdirSync(home)
+      mkdirSync(tools)
+      mkdirSync(under)
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, {
+          environment: {
+            PATH: `C:\\Windows\\System32;${tools};${under}`,
+            USERPROFILE: home,
+            SystemRoot: "C:\\Windows",
+            ProgramFiles: "C:\\Program Files",
+            "ProgramFiles(x86)": "C:\\Program Files (x86)",
+            ProgramData: "C:\\ProgramData",
+            SystemDrive: "C:",
+          },
+        }),
+      )
+      const readonly = request.filesystem.readonlyPaths
+      assert.ok(readonly.includes(home), "the user profile is read-only")
+      assert.ok(readonly.includes("C:\\Windows"), "the OS directory is read-only")
+      assert.ok(readonly.includes("C:\\Program Files"), "program files are read-only")
+      assert.ok(readonly.includes("C:\\Program Files (x86)"), "32-bit program files are read-only")
+      assert.ok(readonly.includes("C:\\ProgramData"), "program data is read-only")
+      assert.ok(readonly.includes("C:\\"), "the system drive root is readable (pwsh enumerates it on startup)")
+      assert.ok(readonly.includes(tools), "PATH toolchain directories are read-only")
+      assert.ok(!readonly.includes(under), "PATH entries under a read-write grant must not carve the workspace read-only")
+      assert.ok(readonly.includes(path.dirname(root)), "workspace ancestors are generated read-only")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(world, { recursive: true, force: true })
+    }
+  })
+
+  test("denies the credential stores under the user profile", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-credentials-"))
+    const world = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-credworld-"))
+    try {
+      const home = path.join(world, "home")
+      mkdirSync(path.join(home, ".ssh"), { recursive: true })
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { environment: { PATH: "", USERPROFILE: home } }),
+      )
+      const denied = request.filesystem.deniedPaths
+      assert.ok(denied.includes(path.join(home, ".ssh")), "existing credential stores are denied")
+      assert.ok(denied.includes(path.join(home, ".gnupg")), "credential stores are denied even when not yet present")
+      for (const store of [".aws", ".azure", ".kube"]) {
+        assert.ok(denied.includes(path.join(home, store)), `${store} is denied`)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(world, { recursive: true, force: true })
+    }
+  })
+
+  test("redirects toolchain caches to a stable per-tool directory under temp", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-cache-"))
+    try {
+      const temporary = path.join(root, "tmp")
+      mkdirSync(temporary)
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: temporary } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      const expected = {
+        npm_config_cache: path.join(temporary, "kilo", "sandbox-cache", "npm"),
+        NUGET_PACKAGES: path.join(temporary, "kilo", "sandbox-cache", "nuget"),
+        PIP_CACHE_DIR: path.join(temporary, "kilo", "sandbox-cache", "pip"),
+        CARGO_HOME: path.join(temporary, "kilo", "sandbox-cache", "cargo"),
+      }
+      for (const [key, value] of Object.entries(expected)) {
+        assert.equal(request.environment[key], value, `${key} is redirected under the temp grant`)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps user-set cache locations over the shipped redirection defaults", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-cache-user-"))
+    try {
+      const temporary = path.join(root, "tmp")
+      mkdirSync(temporary)
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: temporary } }),
+        launch(root, { environment: { PATH: "", npm_config_cache: "D:\\warm", NPM_CONFIG_CACHE: "D:\\cased" } }),
+      )
+      assert.equal(request.environment.npm_config_cache, "D:\\warm", "an existing cache location is never clobbered")
+      assert.equal(request.environment.NPM_CONFIG_CACHE, "D:\\cased", "case-insensitive duplicates also count as existing")
+      assert.equal(request.environment.NUGET_PACKAGES, path.join(temporary, "kilo", "sandbox-cache", "nuget"), "unset tools still redirect")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("does not redirect caches when no temporary directory is granted", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-cache-none-"))
+    try {
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.equal(request.environment.npm_config_cache, undefined)
+      assert.equal(request.environment.NUGET_PACKAGES, undefined)
+      assert.equal(request.environment.PIP_CACHE_DIR, undefined)
+      assert.equal(request.environment.CARGO_HOME, undefined)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("defaults the working directory to the first read-write grant", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-cwd-"))
+    const second = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-cwd-second-"))
+    try {
+      const withCwd = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { cwd: second }),
+      )
+      assert.equal(withCwd.workingDirectory, second, "an explicit working directory is preserved")
+      const defaulted = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { cwd: undefined }),
+      )
+      assert.equal(defaulted.workingDirectory, root, "without a working directory the first read-write grant is used")
+      const none = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: path.join(root, "missing"), kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { cwd: undefined }),
+      )
+      assert.equal(none.workingDirectory, undefined, "no read-write grant means no working directory")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(second, { recursive: true, force: true })
+    }
+  })
+
+  test("composes the strictest-default UI posture with the GUI subsystem available", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-ui-"))
+    try {
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.deepEqual(request.ui, { disable: false }, "the kill switch must be off so USER32-linked tools (node, git, PowerShell) start; clipboard and injection stay denied by the MXC UI policy defaults")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("never carves a read-write path read-only through ancestor generation", () => {
+    const outer = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-anc-outer-"))
+    const temporary = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-anc-temp-"))
+    try {
+      const nested = path.join(outer, "nested", "ws")
+      mkdirSync(nested, { recursive: true })
+      const request = translate(
+        profile(outer, {
+          filesystem: {
+            allowWrite: [
+              { path: outer, kind: "subtree" },
+              { path: nested, kind: "subtree" },
+            ],
+            denyWrite: [],
+            denyNames: [],
+            temporaryDirectory: temporary,
+          },
+        }),
+        launch(outer, { environment: { PATH: "" } }),
+      )
+      const readonly = request.filesystem.readonlyPaths
+      assert.ok(!readonly.includes(temporary), "the temp grant must not be re-granted read-only as a workspace ancestor")
+      assert.ok(!readonly.includes(outer), "a workspace containing another workspace stays read-write")
+      assert.ok(!readonly.some((entry) => sameTree(entry, temporary)), "no ancestor under the temp grant may be read-only")
+      assert.ok(readonly.includes(os.tmpdir()), "genuine ancestors above the temp grant stay read-only")
+    } finally {
+      rmSync(outer, { recursive: true, force: true })
+      rmSync(temporary, { recursive: true, force: true })
     }
   })
 
@@ -304,10 +497,12 @@ describe("mxc backend through the per-command seam", () => {
         workingDirectory?: string
         filesystem: { readwritePaths: string[] }
         network: { egress: { default: string } }
+        ui: { disable: boolean }
         environment: Record<string, string>
       }
       assert.deepEqual(request.filesystem.readwritePaths, [root, path.join(root, "tmp")])
       assert.deepEqual(request.network, { egress: { default: "deny" } })
+      assert.deepEqual(request.ui, { disable: false })
       assert.equal(request.workingDirectory, root)
       assert.equal(request.command, "node -e console.log('confined')")
       assert.equal(request.environment.KILO_SET, "1")
@@ -343,21 +538,29 @@ async function liveSdk(t: import("node:test").TestContext) {
   return entry
 }
 
-function liveProfile(root: string): Profile {
+function liveProfile(root: string | Array<string>, temporary: string | undefined = os.tmpdir()): Profile {
+  const roots = Array.isArray(root) ? root : [root]
   return {
     filesystem: {
-      allowWrite: [{ path: root, kind: "subtree" }],
+      allowWrite: roots.map((entry) => ({ path: entry, kind: "subtree" })),
       denyWrite: [],
-      denyNames: [],
+      denyNames: [".env"],
+      temporaryDirectory: temporary,
     },
     network: { mode: "deny", allowedHosts: [] },
     environment: { deny: [], set: {} },
   }
 }
 
-async function runConfined(profile: Profile, command: string, args: Array<string>, env: Record<string, string>) {
+async function runConfined(
+  profile: Profile,
+  command: string,
+  args: Array<string>,
+  env: Record<string, string>,
+  options: { cwd?: string } = {},
+) {
   const prepared = await Effect.runPromise(
-    Effect.scoped(confine(profile, { command, args, environment: { ...process.env } })),
+    Effect.scoped(confine(profile, { command, args, cwd: options.cwd, environment: { ...process.env } })),
   )
   const child = spawn(prepared.command, prepared.args, { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
   let stdout = ""
@@ -702,6 +905,304 @@ describe("mxc live enforcement (probe-gated)", () => {
       assert.notEqual(trimmed.code, 0, "an empty allowlist must deny the same request the full list allows")
     } finally {
       await Promise.all([allowRegistry.close(), allowNothing.close()])
+    }
+  })
+})
+
+// Seam 3 — acceptance for the default grant table: the six ordinary tools must
+// launch and operate under the strictest defaults, and every denial posture of
+// the table must hold against real OS enforcement.
+describe("mxc default grant table acceptance (probe-gated)", () => {
+  function tool(t: import("node:test").TestContext, name: string, probe: () => boolean, reason: string) {
+    if (!probe()) return t.skip(`${name} is not installed on this host: ${reason}`)
+    return true
+  }
+
+  test("cmd launches and operates under the default table", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-cmd-"))
+    try {
+      const probe = path.join(root, "cmd-ok.txt")
+      const result = await runConfined(
+        liveProfile(root),
+        "cmd",
+        ["/c", `(echo CMD_OK) > ${probe} & type ${probe}`],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: root },
+      )
+      assert.equal(result.code, 0)
+      assert.match(result.stdout, /CMD_OK/)
+      assert.ok(existsSync(probe), "the confined cmd write must land on the host")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("Windows PowerShell launches and operates under the default table", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-ps51-"))
+    try {
+      const result = await runConfined(
+        liveProfile(root),
+        "powershell",
+        ["-NoProfile", "-Command", "Set-Content -Path ps51-ok.txt -Value PS51_OK; Get-Content ps51-ok.txt"],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: root },
+      )
+      assert.equal(result.code, 0, `the 0xC0000142 naive-table failure must not recur: ${result.stderr}`)
+      assert.match(result.stdout, /PS51_OK/)
+      assert.ok(existsSync(path.join(root, "ps51-ok.txt")))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("PowerShell 7 launches and operates under the default table", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    if (!tool(t, "pwsh", () => spawnSync("pwsh", ["-NoProfile", "-Command", "exit 0"]).status === 0, "pwsh probe failed")) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-pwsh-"))
+    try {
+      const result = await runConfined(
+        liveProfile(root),
+        "pwsh",
+        ["-NoProfile", "-Command", "Set-Content -Path pwsh-ok.txt -Value PWSH_OK; Get-Content pwsh-ok.txt"],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: root },
+      )
+      assert.equal(result.code, 0, `pwsh must operate under the default table: ${result.stderr}`)
+      assert.match(result.stdout, /PWSH_OK/)
+      assert.ok(existsSync(path.join(root, "pwsh-ok.txt")))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("node launches and operates under the default table", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-node-"))
+    try {
+      const result = await runConfined(
+        liveProfile(root),
+        "node",
+        ["-e", "require('fs').writeFileSync('node-ok.txt','ok'); console.log('NODE_OK', require('fs').readFileSync('node-ok.txt','utf8'))"],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: root },
+      )
+      assert.equal(result.code, 0)
+      assert.match(result.stdout, /NODE_OK ok/)
+      assert.ok(existsSync(path.join(root, "node-ok.txt")))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("npm launches, redirects its cache, and installs under the default table", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-npm-"))
+    const cache = path.join(os.tmpdir(), "kilo", "sandbox-cache", "npm")
+    try {
+      rmSync(path.join(os.tmpdir(), "kilo", "sandbox-cache"), { recursive: true, force: true })
+      const version = await runConfined(liveProfile(root), "cmd", ["/c", "npm --version"], {
+        KILO_MXC_SDK_ENTRY: entry,
+      })
+      assert.equal(version.code, 0, `npm must launch: ${version.stderr}`)
+      assert.match(version.stdout, /\d+\.\d+\.\d+/)
+
+      const located = await runConfined(liveProfile(root), "cmd", ["/c", "npm config get cache"], {
+        KILO_MXC_SDK_ENTRY: entry,
+      })
+      assert.equal(located.code, 0)
+      assert.equal(located.stdout.trim(), cache, "npm's cache must point at the redirected per-tool directory")
+
+      const pkg = path.join(root, "fixture-pkg")
+      mkdirSync(pkg)
+      writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "kilo-mxc-fixture", version: "1.0.0" }))
+      writeFileSync(path.join(pkg, "index.js"), "module.exports = 42\n")
+      const packed = spawnSync("cmd", ["/c", "npm pack --json"], { cwd: pkg, encoding: "utf8" })
+      assert.equal(packed.status, 0, `host-side npm pack must succeed: ${packed.stderr}`)
+      const tarball = path.join(pkg, (JSON.parse(packed.stdout) as Array<{ filename: string }>)[0].filename)
+
+      const workspace = path.join(root, "ws")
+      mkdirSync(workspace)
+      const install = await runConfined(
+        liveProfile(workspace),
+        "cmd",
+        ["/c", `npm install --no-audit --no-fund --offline ${tarball}`],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: workspace },
+      )
+      assert.equal(install.code, 0, `confined npm install must work: ${install.stderr}`)
+      const required = await runConfined(
+        liveProfile(workspace),
+        "node",
+        ["-e", "console.log('NPM_INSTALL_OK', require('kilo-mxc-fixture'))"],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: workspace },
+      )
+      assert.match(required.stdout, /NPM_INSTALL_OK 42/)
+      assert.ok(existsSync(path.join(cache, "_cacache")), "npm's cache must land under temp, not the profile")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("git launches and operates under the default table", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    if (!tool(t, "git", () => spawnSync("git", ["--version"]).status === 0, "git probe failed")) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-git-"))
+    try {
+      writeFileSync(path.join(root, "tracked.txt"), "content\n")
+      const identity = ["-c", "user.name=Sandbox Probe", "-c", "user.email=probe@example.com"]
+      const init = await runConfined(liveProfile(root), "git", ["init", "."], { KILO_MXC_SDK_ENTRY: entry }, { cwd: root })
+      assert.equal(init.code, 0, `git init must work: ${init.stderr}`)
+      const add = await runConfined(liveProfile(root), "git", ["add", "."], { KILO_MXC_SDK_ENTRY: entry }, { cwd: root })
+      assert.equal(add.code, 0, `git add must work: ${add.stderr}`)
+      const commit = await runConfined(
+        liveProfile(root),
+        "git",
+        [...identity, "commit", "-m", "sandbox probe"],
+        { KILO_MXC_SDK_ENTRY: entry },
+        { cwd: root },
+      )
+      assert.equal(commit.code, 0, `git commit must reach .git read-write: ${commit.stderr}`)
+      const log = await runConfined(liveProfile(root), "git", ["log", "--oneline"], { KILO_MXC_SDK_ENTRY: entry }, { cwd: root })
+      assert.match(log.stdout, /sandbox probe/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("profile reads succeed and profile writes are denied", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const readProbe = path.join(os.homedir(), "kilo-mxc-read-probe.txt")
+    const writeProbe = path.join(os.homedir(), "kilo-mxc-write-probe.txt")
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-profile-"))
+    try {
+      writeFileSync(readProbe, "PROFILE_CONTENT\n")
+      const read = await runConfined(liveProfile(root), "cmd", ["/c", `type ${readProbe}`], { KILO_MXC_SDK_ENTRY: entry })
+      assert.equal(read.code, 0, `profile reads must succeed: ${read.stderr}`)
+      assert.match(read.stdout, /PROFILE_CONTENT/)
+      const write = await runConfined(
+        liveProfile(root),
+        "cmd",
+        ["/c", `(echo x) > ${writeProbe} & if exist ${writeProbe} (echo PROBE_WRITTEN) else (echo PROBE_DENIED)`],
+        { KILO_MXC_SDK_ENTRY: entry },
+      )
+      assert.match(write.stderr, /Access is denied/)
+      assert.match(write.stdout, /PROBE_DENIED/)
+      assert.equal(existsSync(writeProbe), false, "no host artefact may remain")
+    } finally {
+      rmSync(readProbe, { force: true })
+      rmSync(writeProbe, { force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("reading a credential store is denied", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const store = [".ssh", ".gnupg", ".aws", ".azure", ".kube"]
+      .map((name) => path.join(os.homedir(), name))
+      .find((dir) => existsSync(dir) && readdirSync(dir).some((file) => statSync(path.join(dir, file)).isFile()))
+    if (!store) return t.skip("no credential store with a readable candidate file exists on this host")
+    const secret = path.join(store, readdirSync(store).find((file) => statSync(path.join(store, file)).isFile()) ?? "")
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-cred-"))
+    try {
+      const result = await runConfined(liveProfile(root), "cmd", ["/c", `type ${secret}`], { KILO_MXC_SDK_ENTRY: entry })
+      assert.match(result.stderr, /Access is denied/, "the credential store contents must be unreadable")
+      assert.notEqual(result.code, 0)
+      assert.equal(result.stdout, "", "no store content may leak to stdout")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("reading a secret-named file inside the workspace is denied", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-secret-"))
+    try {
+      writeFileSync(path.join(root, ".env"), "SECRET=1\n")
+      const result = await runConfined(liveProfile(root), "cmd", ["/c", "type .env"], {
+        KILO_MXC_SDK_ENTRY: entry,
+      }, { cwd: root })
+      assert.match(result.stderr, /Access is denied/, "the secret-named file must be unreadable")
+      assert.doesNotMatch(result.stdout, /SECRET/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("redirected caches are reused across commands and revoked by deletion", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-cache-"))
+    const cache = path.join(os.tmpdir(), "kilo", "sandbox-cache", "npm")
+    const marker = path.join(cache, "marker")
+    try {
+      rmSync(path.join(os.tmpdir(), "kilo", "sandbox-cache"), { recursive: true, force: true })
+      const before = await runConfined(liveProfile(root), "cmd", [`/c`, `if exist ${marker} (echo REUSED) else (echo MISSING)`], {
+        KILO_MXC_SDK_ENTRY: entry,
+      })
+      assert.match(before.stdout, /MISSING/)
+      mkdirSync(cache, { recursive: true })
+      writeFileSync(marker, "warm\n")
+      const reused = await runConfined(liveProfile(root), "cmd", [`/c`, `if exist ${marker} (echo REUSED) else (echo MISSING)`], {
+        KILO_MXC_SDK_ENTRY: entry,
+      })
+      assert.match(reused.stdout, /REUSED/, "the same stable cache directory is visible across commands")
+      rmSync(path.join(os.tmpdir(), "kilo", "sandbox-cache"), { recursive: true, force: true })
+      const revoked = await runConfined(liveProfile(root), "cmd", [`/c`, `if exist ${marker} (echo REUSED) else (echo MISSING)`], {
+        KILO_MXC_SDK_ENTRY: entry,
+      })
+      assert.match(revoked.stdout, /MISSING/, "deleting the directory revokes the cache")
+    } finally {
+      rmSync(path.join(os.tmpdir(), "kilo", "sandbox-cache"), { recursive: true, force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("multiple workspaces are each granted read-write", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const first = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-multi-a-"))
+    const second = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-multi-b-"))
+    try {
+      const left = path.join(first, "left.txt")
+      const right = path.join(second, "right.txt")
+      const result = await runConfined(
+        liveProfile([first, second]),
+        "cmd",
+        ["/c", `(echo L) > ${left} & (echo R) > ${right} & if exist ${left} if exist ${right} (echo BOTH_OK) else (echo BOTH_MISSING)`],
+        { KILO_MXC_SDK_ENTRY: entry },
+      )
+      assert.equal(result.code, 0)
+      assert.match(result.stdout, /BOTH_OK/)
+      assert.ok(existsSync(left) && existsSync(right))
+    } finally {
+      rmSync(first, { recursive: true, force: true })
+      rmSync(second, { recursive: true, force: true })
+    }
+  })
+
+  test("the working directory defaults to the first read-write grant", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const first = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-cwd-a-"))
+    const second = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-acc-cwd-b-"))
+    try {
+      const result = await runConfined(liveProfile([first, second]), "cmd", ["/c", "cd"], { KILO_MXC_SDK_ENTRY: entry })
+      assert.equal(result.stdout.trim(), first)
+    } finally {
+      rmSync(first, { recursive: true, force: true })
+      rmSync(second, { recursive: true, force: true })
     }
   })
 })

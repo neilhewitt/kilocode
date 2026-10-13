@@ -12,11 +12,14 @@ import type { PathRule, Profile } from "./profile"
 // launch into `<node> <run-shim> <request>`, so every command still flows
 // through the existing per-command seam (prepareCommand → spawner) and the
 // confined execution happens inside the sidecar's processcontainer sandbox.
-// Execution is transient — one sandbox per command (ADR 0001). Egress is
-// deny-all by default, allowlisted through the sidecar's loopback proxy, or
-// relaxed by recorded raw CIDR/port rules (ADR 0003, ticket 16); the full
-// strictest-default grant table (ancestors, credential stores, cache
-// redirection) is composed by the default-grant-table work, not here.
+// Execution is transient — one sandbox per command (ADR 0001) — and every
+// command is composed with the full strictest-default grant table (ADR 0002):
+// workspaces and temp read-write; the user profile, toolchains, OS directories,
+// and workspace ancestors read-only; credential stores and secret-named files
+// denied; toolchain caches redirected under the temp grant; the GUI subsystem
+// kept available with clipboard/injection denied so ordinary tooling starts.
+// Egress (ADR 0003, ticket 16) is deny-all by default, allowlisted through the
+// sidecar's loopback proxy, or relaxed by recorded raw CIDR/port rules.
 
 declare const KILO_MXC_SHIM_PATH: string | undefined
 
@@ -56,13 +59,63 @@ function commandLine(launch: Launch) {
   return `${shell} -c ${quoteWindows(body)}`
 }
 
-// The minimal read-only launch baseline: the OS and program directories every
-// real command needs just to start. The full validated default table is the
-// default-grant-table work's concern; this keeps the minimal policy launchable.
-function baseline() {
+// Windows environment lookups are case-insensitive; the merged launch
+// environment may carry any casing.
+function envValue(environment: Launch["environment"], name: string) {
+  const source = environment ?? {}
+  if (!caseInsensitive) return source[name]
+  for (const [key, value] of Object.entries(source)) {
+    if (key.toLowerCase() === name.toLowerCase()) return value
+  }
+  return undefined
+}
+
+// Ancestor directories of a granted root, up to and including the drive root:
+// tools that walk parents looking for configuration (git, editors) must not
+// fail just because the workspace sits nested (spec: workspace ancestors are
+// generated read-only automatically).
+function ancestors(of: string) {
+  const found: Array<string> = []
+  let current = path.resolve(of)
+  while (true) {
+    const parent = path.dirname(current)
+    if (parent === current) return found
+    found.push(parent)
+    current = parent
+  }
+}
+
+function sameOrUnder(candidate: string, root: string) {
+  const left = path.resolve(candidate)
+  const right = path.resolve(root)
+  if (caseInsensitive) {
+    return left.toLowerCase() === right.toLowerCase() || left.toLowerCase().startsWith(`${right.toLowerCase()}\\`)
+  }
+  return left === right || left.startsWith(`${right}\\`)
+}
+
+// The strictest-default readonly half of the grant table: the user profile,
+// OS directories, the system drive root, and the toolchain directories named
+// on PATH (mirroring the MXC SDK's host-discovery policy helpers, composed here
+// so the translated request stays pure and testable at the backend seam).
+// Entries at or under a read-write grant are dropped — a workspace is never
+// carved read-only by its own PATH.
+function readonlyDefaults(environment: Launch["environment"], readwrite: ReadonlyArray<string>) {
   if (process.platform !== "win32") return []
-  const roots = [process.env.SystemRoot, process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]
-  return roots.filter((value): value is string => typeof value === "string")
+  const systemDrive = envValue(environment, "SystemDrive")
+  const roots = [
+    envValue(environment, "USERPROFILE"),
+    envValue(environment, "SystemRoot"),
+    envValue(environment, "ProgramFiles"),
+    envValue(environment, "ProgramFiles(x86)"),
+    envValue(environment, "ProgramData"),
+    systemDrive === undefined ? undefined : `${systemDrive}\\`,
+  ].filter((value): value is string => typeof value === "string")
+  const pathValue = envValue(environment, "PATH") ?? ""
+  const toolchains = pathValue
+    .split(";")
+    .filter((entry) => entry.trim() !== "" && existsSync(entry.trim()) && statSync(entry.trim()).isDirectory())
+  return [...roots, ...toolchains].filter((entry) => !readwrite.some((grant) => sameOrUnder(entry, grant)))
 }
 
 function exists(rule: PathRule) {
@@ -91,10 +144,16 @@ function list(dir: string) {
   }
 }
 
-// Finds deny-named entries under the writable roots so they can be denied
-// outright (the spec maps denyNames onto denied paths). The scan is
-// best-effort-bounded: an unreadable directory is denied as a whole rather than
-// scanned, mirroring the Bubblewrap backend's fail-closed posture.
+// Finds deny-named FILES under the writable roots so they can be denied
+// outright (the spec maps denyNames onto denied paths for secret-named files).
+// Directories are never blanket-denied by name: `.git` and friends stay under
+// their parent grant so VCS metadata keeps working (git must operate under the
+// default table); credential-store directories are denied explicitly instead.
+// The scan is bounded by host readability: a directory the host-side scan
+// cannot enumerate is skipped, so a deny-named file hidden inside it would not
+// be denied — unlike the Bubblewrap backend, which fail-closes by re-binding
+// such a directory read-only. Only reachable through ACL anomalies inside an
+// already-writable workspace; recorded as a known caveat of the win32 mapping.
 function scan(root: string, names: ReadonlySet<string>, found: Set<string>) {
   const pending = [root]
   while (pending.length > 0) {
@@ -103,11 +162,8 @@ function scan(root: string, names: ReadonlySet<string>, found: Set<string>) {
     for (const entry of list(dir)) {
       const target = path.join(dir, entry.name)
       const name = caseInsensitive ? entry.name.toLowerCase() : entry.name
-      const match = caseInsensitive ? [...names].some((n) => n.toLowerCase() === name) : names.has(name)
-      if (match) {
-        found.add(target)
-        continue
-      }
+      const match = caseInsensitive ? [...names].some((n) => n.toLowerCase() === name) : names.has(entry.name)
+      if (match && entry.isFile()) found.add(target)
       if (entry.isDirectory()) pending.push(target)
     }
   }
@@ -138,6 +194,20 @@ const proxyVariables = new Set([
   "no_proxy",
 ])
 
+// Credential stores are denied outright — read and write — even though the
+// profile around them is merely read-only: sandboxed commands must not be able
+// to read the user's keys (spec user story 11). Denied unconditionally, not
+// only when the directory exists, so a store created after the table was
+// composed is still covered on the next command.
+const credentialStores = [".ssh", ".gnupg", ".aws", ".azure", ".kube"]
+
+function deniedCredentials(environment: Launch["environment"]) {
+  if (process.platform !== "win32") return []
+  const home = envValue(environment, "USERPROFILE")
+  if (home === undefined) return []
+  return credentialStores.map((store) => path.join(home, store))
+}
+
 function safeEnvironment(environment: Launch["environment"]) {
   const source = environment ?? {}
   const safe: Record<string, string> = {}
@@ -160,6 +230,43 @@ function egressOf(network: Profile["network"]): RunEgress {
   return { default: "deny" }
 }
 
+// The shipped cache-redirection default list: toolchains that cache into the
+// read-only user profile are pointed at a stable per-tool directory under the
+// temp grant instead (ADR 0002 — stable across sessions, revoked by deleting
+// the directory, user-extensible via the profile's environment set, which the
+// backend merges in before translation and which therefore always wins over
+// these defaults).
+const cacheRedirections: ReadonlyArray<{ key: string; tool: string }> = [
+  { key: "npm_config_cache", tool: "npm" },
+  { key: "NUGET_PACKAGES", tool: "nuget" },
+  { key: "PIP_CACHE_DIR", tool: "pip" },
+  { key: "CARGO_HOME", tool: "cargo" },
+]
+
+function redirectCaches(environment: Record<string, string>, temporary: string | undefined) {
+  if (temporary === undefined) return environment
+  const redirected = { ...environment }
+  for (const { key, tool } of cacheRedirections) {
+    const existing = Object.keys(redirected).find((name) =>
+      caseInsensitive ? name.toLowerCase() === key.toLowerCase() : name === key,
+    )
+    if (existing === undefined) redirected[key] = path.join(temporary, "kilo", "sandbox-cache", tool)
+  }
+  return redirected
+}
+
+// The strictest-default UI posture: the GUI subsystem must stay available
+// because ordinary development tooling imports USER32.dll (node, git, both
+// PowerShells, even where.exe), whose DLL initialisation dies with the
+// 0xC0000142 STATUS_DLL_INIT_FAILED under DisallowWin32kSystemCalls — the
+// motivating failure of the terminal spike. Everything the kill switch was
+// protecting against — clipboard reads and writes, input injection, desktop
+// switching, system setting changes, IME — remains denied by the MXC UI
+// policy's default-deny fields whenever the subsystem is enabled.
+function uiDefaults() {
+  return { disable: false }
+}
+
 // Seam 1: the pure Profile → MXC request translation.
 export function translate(profile: Profile, launch: Launch): RunCommand {
   const allow = distinct(
@@ -169,18 +276,22 @@ export function translate(profile: Profile, launch: Launch): RunCommand {
   const readwrite = temporary && existsSync(temporary) && !allow.includes(temporary) ? [...allow, temporary] : allow
   const readonly = distinct([
     ...profile.filesystem.denyWrite.filter(exists).map((rule) => rule.path),
-    ...baseline(),
+    ...readwrite
+      .flatMap((grant) => ancestors(grant))
+      .filter((entry) => !readwrite.some((grant) => sameOrUnder(entry, grant))),
+    ...readonlyDefaults(launch.environment, readwrite),
   ])
   return {
     command: commandLine(launch),
-    ...(launch.cwd === undefined ? {} : { workingDirectory: launch.cwd }),
+    ...(launch.cwd === undefined ? { workingDirectory: readwrite[0] } : { workingDirectory: launch.cwd }),
     filesystem: {
       readwritePaths: readwrite,
       readonlyPaths: readonly,
-      deniedPaths: deniedNames(profile, profile.filesystem.allowWrite.filter(exists)),
+      deniedPaths: distinct([...deniedNames(profile, profile.filesystem.allowWrite.filter(exists)), ...deniedCredentials(launch.environment)]),
     },
     network: { egress: egressOf(profile.network) },
-    environment: safeEnvironment(launch.environment),
+    ui: uiDefaults(),
+    environment: redirectCaches(safeEnvironment(launch.environment), temporary !== undefined && existsSync(temporary) ? temporary : undefined),
   }
 }
 
@@ -200,8 +311,14 @@ function shim() {
   return fileURLToPath(import.meta.resolve("@kilocode/mxc-sidecar/run-shim"))
 }
 
-function runtime() {
+// The bundled Node runtime that hosts the sidecar (ADR 0005). Shared by the
+// run shim and the read-only capability probe so both launch the same unit.
+export function mxcRuntime() {
   return process.env.KILO_MXC_NODE ?? process.execPath
+}
+
+function runtime() {
+  return mxcRuntime()
 }
 
 function setup(cause: unknown, launch: Launch) {

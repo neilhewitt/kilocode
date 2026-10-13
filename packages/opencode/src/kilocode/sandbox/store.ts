@@ -16,6 +16,8 @@ export namespace SandboxStore {
     // Recorded raw CIDR/port egress relaxations; absent when none are configured.
     allowedCidrs?: ReadonlyArray<CidrPortRule>
     version: number
+    /** Set when a host-gate refusal was resolved as continue-unsandboxed: confinement is off by explicit choice. */
+    unsandboxed?: boolean
   }
 
   export const root = path.join(realpathSync.native(path.dirname(Global.Path.state)), "kilo-sandbox-policy")
@@ -43,6 +45,7 @@ export namespace SandboxStore {
     if (!base) return false
     if (state.allowedHosts !== undefined && !Array.isArray(state.allowedHosts)) return false
     if (state.writablePaths !== undefined && !Array.isArray(state.writablePaths)) return false
+    if (state.unsandboxed !== undefined && typeof state.unsandboxed !== "boolean") return false
     if (Array.isArray(state.allowedHosts) && state.allowedHosts.some((value) => typeof value !== "string")) return false
     if (Array.isArray(state.writablePaths) && state.writablePaths.some((value) => typeof value !== "string"))
       return false
@@ -67,6 +70,7 @@ export namespace SandboxStore {
       writablePaths: (state.writablePaths as string[] | undefined) ?? [],
       ...(Array.isArray(state.allowedCidrs) ? { allowedCidrs: state.allowedCidrs as ReadonlyArray<CidrPortRule> } : {}),
       version: state.version as number,
+      ...(state.unsandboxed === undefined ? {} : { unsandboxed: state.unsandboxed as boolean }),
     } satisfies Snapshot
   }
 
@@ -92,5 +96,13 @@ export namespace SandboxStore {
 
   export async function dispose(sessionID: SessionID) {
     await fs.rm(dir(sessionID), { recursive: true, force: true })
+  }
+
+  /** Appends one sandbox gate audit record for a session as a JSON line. */
+  export async function appendAudit(sessionID: SessionID, entry: Record<string, unknown>) {
+    const folder = dir(sessionID)
+    await fs.mkdir(folder, { recursive: true, mode: 0o700 })
+    const line = JSON.stringify({ time: new Date().toISOString(), ...entry }) + "\n"
+    await fs.appendFile(path.join(folder, "audit.jsonl"), line, "utf8")
   }
 }

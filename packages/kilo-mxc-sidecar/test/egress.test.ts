@@ -20,6 +20,7 @@ function command(egress: RunCommand["network"]["egress"]): RunCommand {
     command: "cmd /c echo hi",
     filesystem: { readwritePaths: ["C:\\w"], readonlyPaths: [], deniedPaths: [] },
     network: { egress },
+    ui: { disable: false },
     environment: {},
   }
 }
