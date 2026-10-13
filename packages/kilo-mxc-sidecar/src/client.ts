@@ -90,7 +90,17 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
 
   let next = 0
   let buffer = ""
+  let closed = false
   const waiting = new Map<number, { resolve: (result: any) => void; reject: (err: Error) => void }>()
+  // A sidecar that dies mid-request must never hang its caller: pending calls
+  // settle with a rejection when the connection goes away, and any call made
+  // after it is gone rejects instead of waiting forever.
+  socket.on("close", () => {
+    closed = true
+    for (const waiter of waiting.values()) waiter.reject(new Error("the sidecar connection closed"))
+    waiting.clear()
+  })
+  socket.on("error", () => {})
   socket.on("data", (chunk: string) => {
     buffer += chunk
     let index: number
@@ -109,6 +119,10 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
 
   const call = <T>(method: string, extra: Record<string, unknown> = {}) =>
     new Promise<T>((resolve, reject) => {
+      if (closed) {
+        reject(new Error("the sidecar connection closed"))
+        return
+      }
       const requestId = ++next
       waiting.set(requestId, { resolve: resolve as (result: any) => void, reject })
       socket.write(JSON.stringify({ id: requestId, method, ...extra }) + "\n")

@@ -2,7 +2,8 @@ import { existsSync, readdirSync, statSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { Effect, PlatformError } from "effect"
-import type { RunCommand } from "@kilocode/mxc-sidecar"
+import type { CidrPortRule, RunCommand, RunEgress } from "@kilocode/mxc-sidecar"
+import { normalizeDestinations } from "./destination.ts"
 import type { Backend, Launch, Support } from "./backend"
 import type { PathRule, Profile } from "./profile"
 
@@ -11,9 +12,10 @@ import type { PathRule, Profile } from "./profile"
 // launch into `<node> <run-shim> <request>`, so every command still flows
 // through the existing per-command seam (prepareCommand → spawner) and the
 // confined execution happens inside the sidecar's processcontainer sandbox.
-// Execution is transient — one sandbox per command (ADR 0001) — and this ticket
-// ships a deliberately minimal policy: workspace read-write, egress denied.
-// The full strictest-default grant table (ancestors, credential stores, cache
+// Execution is transient — one sandbox per command (ADR 0001). Egress is
+// deny-all by default, allowlisted through the sidecar's loopback proxy, or
+// relaxed by recorded raw CIDR/port rules (ADR 0003, ticket 16); the full
+// strictest-default grant table (ancestors, credential stores, cache
 // redirection) is composed by the default-grant-table work, not here.
 
 declare const KILO_MXC_SHIM_PATH: string | undefined
@@ -121,13 +123,41 @@ function deniedNames(profile: Profile, allow: ReadonlyArray<PathRule>) {
   return [...found].sort((a, b) => a.length - b.length)
 }
 
+// The proxy environment names are stripped from every confined environment:
+// MXC sets the proxy variables itself when a run is pinned to the sidecar's
+// loopback proxy, and a host-side proxy a container cannot reach would only
+// turn allowed traffic into failures.
+const proxyVariables = new Set([
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+])
+
 function safeEnvironment(environment: Launch["environment"]) {
   const source = environment ?? {}
   const safe: Record<string, string> = {}
   for (const [key, value] of Object.entries(source)) {
-    if (value !== undefined && !key.startsWith("KILO_MXC_")) safe[key] = value
+    if (value !== undefined && !key.startsWith("KILO_MXC_") && !proxyVariables.has(key)) safe[key] = value
   }
   return safe
+}
+
+// Egress posture (ADR 0003): relaxations are explicit and recorded, and MXC
+// rejects direct rules alongside a proxy, so a profile carrying raw CIDR/port
+// rules runs on those rules alone; otherwise proxy mode rides the sidecar's
+// loopback proxy with the normalised hostname allowlist (an empty list is a
+// deliberate deny-all), deny stays Model 3, and allow is unrestricted.
+function egressOf(network: Profile["network"]): RunEgress {
+  const relaxations: ReadonlyArray<CidrPortRule> = network.allowedCidrs ?? []
+  if (relaxations.length > 0) return { default: "cidr", allow: relaxations }
+  if (network.mode === "allow") return { default: "allow" }
+  if (network.mode === "proxy") return { default: "proxy", allowedHosts: normalizeDestinations(network.allowedHosts) }
+  return { default: "deny" }
 }
 
 // Seam 1: the pure Profile → MXC request translation.
@@ -149,21 +179,13 @@ export function translate(profile: Profile, launch: Launch): RunCommand {
       readonlyPaths: readonly,
       deniedPaths: deniedNames(profile, profile.filesystem.allowWrite.filter(exists)),
     },
-    network: {
-      egress: { default: profile.network.mode === "allow" ? "allow" : "deny" },
-    },
+    network: { egress: egressOf(profile.network) },
     environment: safeEnvironment(launch.environment),
   }
 }
 
 export function supportFor(platform: string, network?: Profile["network"]): Support {
   if (platform !== "win32") return { available: false, reason: "The MXC sandbox backend requires Windows" }
-  if (network?.mode === "proxy") {
-    return {
-      available: false,
-      reason: "The MXC sandbox backend requires the loopback proxy for proxy network mode; it is not available yet",
-    }
-  }
   return { available: true }
 }
 

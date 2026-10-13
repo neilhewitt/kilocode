@@ -76,7 +76,7 @@ describe("run shim", () => {
       assert.equal(result.stdout, "confined stdout\n")
       assert.ok(result.stderr.includes("confined stderr\n"))
       assert.ok(result.stderr.includes("[kilo-mxc] scripted warning"), "warnings must surface on stderr")
-      assert.deepEqual(events(log), [{ type: "run", command: payload }])
+      assert.deepEqual(events(log), [{ type: "run", command: payload, bindings: {} }])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

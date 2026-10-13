@@ -6,9 +6,9 @@ import { connect, createServer as createNetServer, type Socket } from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { Context, Effect, PlatformError } from "effect"
-import { normalizeDestinations, parseDestination, resolveDestination } from "./destination"
+import { normalizeDestinations, parseDestination, resolveDestination } from "./destination.ts"
 import type { Profile } from "./profile"
-import { TlsClientHello } from "./tls-client-hello"
+import { TlsClientHello } from "./tls-client-hello.ts"
 
 export interface ProxyRuntime {
   readonly url: string

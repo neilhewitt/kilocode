@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import { realpathSync } from "node:fs"
 import path from "node:path"
 import { Global } from "@opencode-ai/core/global"
-import type { Profile } from "@kilocode/sandbox"
+import type { CidrPortRule, Profile } from "@kilocode/sandbox"
 import type { SessionID } from "@/session/schema"
 
 export namespace SandboxStore {
@@ -13,6 +13,8 @@ export namespace SandboxStore {
     mode: Profile["network"]["mode"]
     allowedHosts: string[]
     writablePaths: string[]
+    // Recorded raw CIDR/port egress relaxations; absent when none are configured.
+    allowedCidrs?: ReadonlyArray<CidrPortRule>
     version: number
   }
 
@@ -63,6 +65,7 @@ export namespace SandboxStore {
       mode: state.mode as Snapshot["mode"],
       allowedHosts: (state.allowedHosts as string[] | undefined) ?? [],
       writablePaths: (state.writablePaths as string[] | undefined) ?? [],
+      ...(Array.isArray(state.allowedCidrs) ? { allowedCidrs: state.allowedCidrs as ReadonlyArray<CidrPortRule> } : {}),
       version: state.version as number,
     } satisfies Snapshot
   }

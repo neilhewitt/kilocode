@@ -1,4 +1,5 @@
 import { createControlServer } from "./control.ts"
+import { withEgressProxy } from "./egress.ts"
 import { controlEndpoint } from "./endpoint.ts"
 import { PROTOCOL_VERSION } from "./protocol.ts"
 import { runtimeFromEnvironment } from "./sdk.ts"
@@ -16,10 +17,14 @@ if (!id || !token) {
   process.exit(2)
 }
 
-const runtime = await runtimeFromEnvironment()
+// The egress proxy rides the sidecar's lifecycle: proxied runs get their own
+// loopback listener, and every one is released when a run settles, is killed,
+// or the sidecar goes away.
+const runtime = withEgressProxy(await runtimeFromEnvironment())
 const server = createControlServer({ runtime, endpoint: controlEndpoint(id), token })
 server.onShutdown(async () => {
   await server.stop()
+  await runtime.closeProxies()
   process.exit(0)
 })
 await server.listen()
@@ -30,7 +35,11 @@ process.stdout.write(
 // any confined command it is still running must not outlive its caller.
 const farewell = () => {
   server.killAll()
-  void server.stop().then(() => process.exit(0))
+  void server
+    .stop()
+    .then(() => runtime.closeProxies())
+    .catch(() => {})
+    .finally(() => process.exit(0))
 }
 process.stdin.resume()
 process.stdin.on("close", farewell)
