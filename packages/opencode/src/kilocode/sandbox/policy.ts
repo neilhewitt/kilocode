@@ -39,11 +39,16 @@ const locks = new Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number 
 const refreshes = new Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number }>()
 const gates = new Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number }>()
 const permits = 1_000_000
-let revision = 0
-
-GlobalBus.on("event", (event) => {
-  if (event.payload?.type === "global.config.updated" && event.payload.properties?.sandbox === true) revision++
-})
+// The config-change counter, scoped to its only mutation: the global-config
+// subscription bumps it, readers sample it to detect staleness, and nothing
+// else can touch it because the mutable binding lives inside the closure.
+const revision = (() => {
+  let value = 0
+  GlobalBus.on("event", (event) => {
+    if (event.payload?.type === "global.config.updated" && event.payload.properties?.sandbox === true) value++
+  })
+  return () => value
+})()
 
 function key(directory: string, sessionID: SessionID) {
   return directory + "\0" + sessionID
@@ -159,59 +164,43 @@ const logConfigRelaxations = Effect.fn("SandboxPolicy.logConfigRelaxations")(fun
 function engineAudit() {
   return process.env.KILO_MXC_AUDIT_ENGINE === "1"
 }
-function locked<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const entry = locks.get(sessionID) ?? { semaphore: Semaphore.makeUnsafe(1), refs: 0 }
-      entry.refs++
-      locks.set(sessionID, entry)
-      return entry
-    }),
-    (entry) => entry.semaphore.withPermits(1)(effect),
-    (entry) =>
+
+// The ref-counted semaphore pools: one semaphore per session, its entry kept
+// alive while any holder remains. Three independent pools, one shape — each
+// differs only in which map it pools and what it builds. The single-permit
+// pools (a run's lock, a refresh) hold a fixed acquire count of 1; the gate
+// pool takes its permit count per call, same count it built the semaphore
+// with.
+type Pool = Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number }>
+function pooled(entries: Pool, build: () => Semaphore.Semaphore) {
+  return <A, E, R>(sessionID: SessionID, count: number, effect: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
       Effect.sync(() => {
-        entry.refs--
-        if (entry.refs === 0 && locks.get(sessionID) === entry) locks.delete(sessionID)
+        const entry = entries.get(sessionID) ?? { semaphore: build(), refs: 0 }
+        entry.refs++
+        entries.set(sessionID, entry)
+        return entry
       }),
-  )
+      (entry) => entry.semaphore.withPermits(count)(effect),
+      (entry) =>
+        Effect.sync(() => {
+          entry.refs--
+          if (entry.refs === 0 && entries.get(sessionID) === entry) entries.delete(sessionID)
+        }),
+    )
 }
+
+function pooledPermit1(entries: Pool, build: () => Semaphore.Semaphore) {
+  const multi = pooled(entries, build)
+  return <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) => multi(sessionID, 1, effect)
+}
+
+const locked = pooledPermit1(locks, () => Semaphore.makeUnsafe(1))
+const refreshing = pooledPermit1(refreshes, () => Semaphore.makeUnsafe(1))
+const gated = pooled(gates, () => Semaphore.makeUnsafe(permits))
 
 function lockedAll<A, E, R>(sessions: readonly SessionID[], effect: Effect.Effect<A, E, R>) {
   return [...new Set(sessions)].reduceRight((next, sessionID) => locked(sessionID, next), effect)
-}
-
-function refreshing<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const entry = refreshes.get(sessionID) ?? { semaphore: Semaphore.makeUnsafe(1), refs: 0 }
-      entry.refs++
-      refreshes.set(sessionID, entry)
-      return entry
-    }),
-    (entry) => entry.semaphore.withPermits(1)(effect),
-    (entry) =>
-      Effect.sync(() => {
-        entry.refs--
-        if (entry.refs === 0 && refreshes.get(sessionID) === entry) refreshes.delete(sessionID)
-      }),
-  )
-}
-
-function gated<A, E, R>(sessionID: SessionID, count: number, effect: Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const entry = gates.get(sessionID) ?? { semaphore: Semaphore.makeUnsafe(permits), refs: 0 }
-      entry.refs++
-      gates.set(sessionID, entry)
-      return entry
-    }),
-    (entry) => entry.semaphore.withPermits(count)(effect),
-    (entry) =>
-      Effect.sync(() => {
-        entry.refs--
-        if (entry.refs === 0 && gates.get(sessionID) === entry) gates.delete(sessionID)
-      }),
-  )
 }
 
 function gatedAll<A, E, R>(sessions: readonly SessionID[], effect: Effect.Effect<A, E, R>) {
@@ -363,7 +352,7 @@ const snapshot = Effect.fn("SandboxPolicy.snapshot")(function* (sessionID: Sessi
       // session moved or created with an explicit choice keeps that choice instead of resetting. The
       // persisted per-directory preference (last toggled state) is the next precedence, so new sessions
       // inherit the last /sandbox choice. The config default applies when neither is present.
-      const version = revision
+      const version = revision()
       const next = yield* resolveInitial(directory, sessionID)
       yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
       const id = key(directory, sessionID)
@@ -380,11 +369,11 @@ function current(
   inside = false,
 ): Effect.Effect<{ directory: string; state: Snapshot }, never, Config.Service | Database.Service> {
   return Effect.gen(function* () {
-    const expected = revision
+    const expected = revision()
     const state = yield* snapshot(sessionID)
     const id = key(state.directory, sessionID)
     if (synced.get(id) !== expected) yield* inside ? reconcile(sessionID, expected) : refresh(sessionID, expected)
-    if (revision !== expected) return yield* current(sessionID, inside)
+    if (revision() !== expected) return yield* current(sessionID, inside)
     return yield* snapshot(sessionID)
   })
 }
@@ -426,7 +415,7 @@ export const networkRestricted = Effect.fn("SandboxPolicy.networkRestricted")(fu
   return active.state.enabled && active.state.mode !== "allow"
 })
 
-const reconcile = Effect.fn("SandboxPolicy.reconcile")(function* (sessionID: SessionID, version = revision) {
+const reconcile = Effect.fn("SandboxPolicy.reconcile")(function* (sessionID: SessionID, version = revision()) {
   const directory = yield* InstanceState.directory
   return yield* refreshing(
     sessionID,
@@ -453,7 +442,7 @@ const reconcile = Effect.fn("SandboxPolicy.reconcile")(function* (sessionID: Ses
   )
 })
 
-export const refresh = Effect.fn("SandboxPolicy.refresh")((sessionID: SessionID, version = revision) =>
+export const refresh = Effect.fn("SandboxPolicy.refresh")((sessionID: SessionID, version = revision()) =>
   locked(sessionID, reconcile(sessionID, version)),
 )
 
@@ -473,7 +462,7 @@ function change<E, R, F = never, Q = never, P = never, S = never>(
         const stored = yield* read(directory, sessionID)
         const current = stored ?? (yield* resolveInitial(directory, sessionID))
         const enabling = !current.enabled
-        const version = revision
+        const version = revision()
         const base = enabling ? apply(current, SandboxConfig.resolve(yield* (yield* Config.Service).get())) : current
         const gate = yield* SandboxGate.assess()
         const support = backendSupport({ mode: base.mode, allowedHosts: base.allowedHosts })
@@ -560,7 +549,7 @@ export const resolveGate = Effect.fn("SandboxPolicy.resolveGate")(function* (ses
       yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
       const id = key(directory, sessionID)
       snapshots.set(id, next)
-      synced.set(id, revision)
+      synced.set(id, revision())
       const refusal = gate.verdict === "refuse" ? gate.reason : undefined
       const continued = choice === "continue-unsandboxed"
       const reason = continued
@@ -626,7 +615,7 @@ export const relax = Effect.fn("SandboxPolicy.relax")(function* (sessionID: Sess
         yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
         const id = key(directory, sessionID)
         snapshots.set(id, next)
-        synced.set(id, revision)
+        synced.set(id, revision())
         yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, SandboxRelaxation.record(request, "prompt")))
       }
       const support = backendSupport({ mode: next.mode, allowedHosts: next.allowedHosts })
@@ -668,7 +657,7 @@ export const consumeTerminalGrant = Effect.fn("SandboxPolicy.consumeTerminalGran
       yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
       const id = key(directory, sessionID)
       snapshots.set(id, next)
-      synced.set(id, revision)
+      synced.set(id, revision())
       yield* Effect.promise(() =>
         SandboxStore.appendAudit(sessionID, {
           type: "sandbox.terminal.use",
@@ -714,7 +703,7 @@ const inheritSnapshot = Effect.fn("SandboxPolicy.inheritSnapshot")(function* (
   directory: string,
   parent: Snapshot,
   sessionID: SessionID,
-  version = revision,
+  version = revision(),
 ) {
   const child = yield* read(directory, sessionID)
   const next: Snapshot = child

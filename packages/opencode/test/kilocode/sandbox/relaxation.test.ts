@@ -149,4 +149,15 @@ describe("audit mode and relax wiring contracts", () => {
     const handler = read("../../../src/kilocode/server/httpapi/handlers/sandbox.ts")
     expect(handler).toContain("SandboxPolicy.relax(ctx.params.sessionID, ctx.payload)")
   })
+
+  test("the TUI affordance offers prompt-granted relaxations through the relax seam", () => {
+    const plugin = read("../../../src/kilocode/plugins/sandbox.tsx")
+    expect(plugin).toContain('name: "session.sandbox.relax"')
+    expect(plugin).toContain("/sandbox/relax")
+    expect(plugin).toContain("body: JSON.stringify(request)")
+    // The dialog only supplies the request: the grant is persisted and
+    // recorded by the seam (source "prompt"), so the plugin must never write
+    // a session-log line of its own.
+    expect(plugin).not.toContain("appendAudit")
+  })
 })

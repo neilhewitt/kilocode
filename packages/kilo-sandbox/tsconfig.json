@@ -1,1 +1,13 @@
-{"$schema": "https://json.schemastore.org/tsconfig", "extends": "@tsconfig/bun/tsconfig.json", "compilerOptions": {"allowImportingTsExtensions": true, "noEmit": true, "lib": ["ESNext", "DOM", "DOM.Iterable"], "noUncheckedIndexedAccess": false, "types": ["bun"]}, "include": ["src/**/*.ts", "test/**/*.ts"], "exclude": ["node_modules"]}
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "@tsconfig/bun/tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "noUncheckedIndexedAccess": false,
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules"]
+}

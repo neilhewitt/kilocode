@@ -5,6 +5,7 @@ import { readFileSync, rmSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { withEgressProxy } from "../src/egress.ts"
+import { isRunCommand } from "../src/run.ts"
 import type { RunCommand, RunHandle, RunResult } from "../src/run.ts"
 import type { RunBindings, Runtime } from "../src/sdk.ts"
 import { startSidecar } from "../src/client.ts"
@@ -109,6 +110,39 @@ describe("egress wrapper", () => {
     assert.equal(result.warnings.length, 2)
     assert.match(result.warnings[0], /egress relaxation: 140\.82\.112\.0\/20 \[tcp:22\]/)
     assert.match(result.warnings[1], /egress relaxation: 10\.0\.0\.0\/8 \[any\]/)
+  })
+
+  test("names the posture switch when a cidr relaxation replaced a proxy allowlist", async () => {
+    const { runtime } = recording()
+    const wrapped = withEgressProxy(runtime)
+    const handle = await wrapped.run(
+      command({
+        default: "cidr",
+        allow: [{ to: ["10.0.0.0/8"] }],
+        switchedFromProxy: ["registry.npmjs.org:443", "example.com:443"],
+      }),
+    )
+    const warnings = (await handle.wait()).warnings
+    assert.equal(warnings.length, 2)
+    assert.match(warnings[0], /egress relaxation: 10\.0\.0\.0\/8 \[any\]/)
+    assert.match(
+      warnings[1],
+      /egress posture switch: raw CIDR relaxations replace the proxy allowlist for this run — these hostnames no longer flow: registry\.npmjs\.org:443, example\.com:443/,
+    )
+    // A pure cidr posture (never proxied) stays silent about the switch.
+    const plain = await withEgressProxy(recording().runtime)
+      .run(command({ default: "cidr", allow: [{ to: ["10.0.0.0/8"] }] }))
+      .then((handle) => handle.wait())
+    assert.equal(plain.warnings.length, 1)
+  })
+
+  test("a switched cidr command satisfies the wire contract the shim and sidecar share", async () => {
+    const switched: RunCommand = command({
+      default: "cidr",
+      allow: [{ to: ["10.0.0.0/8"] }],
+      switchedFromProxy: ["example.com:443"],
+    })
+    assert.ok(isRunCommand(switched), "the posture-switch marker must ride the validated wire contract")
   })
 
   test("starts no proxy for deny, allow, and cidr runs", async () => {

@@ -32,11 +32,13 @@ import { SandboxStore } from "./store"
 // terminal, and the session log records the start.
 //
 // A genuinely TTY-needed terminal runs unsandboxed only through an explicit,
-// recorded PTY relaxation: a durable config relaxation (re-composed each
-// time), or a prompt-granted one created via the relaxation seam
-// (POST /session/:id/sandbox/relax, kind "terminal", source "prompt") that
-// the first terminal spawn consumes — one grant, one command.
-
+// recorded PTY relaxation: today that means a prompt-granted one created via
+// the relaxation seam (POST /session/:id/sandbox/relax, kind "terminal",
+// source "prompt") that the first terminal spawn consumes — one grant, one
+// command. The gate consults only the session's prompt-granted relaxations;
+// a durable config relaxation CANNOT serve a terminal today — wiring that
+// half is the recorded follow-up, and until it lands, a durable entry alone
+// leaves terminals on the pipes fallback.
 export namespace SandboxTerminal {
   function root(value: string) {
     return { path: value, kind: "subtree" as const }
@@ -129,11 +131,13 @@ export namespace SandboxTerminal {
     // stored snapshot first (written at session init from the config default
     // and preferences), then the directory's last /sandbox toggle.
     const enabled = stored?.enabled ?? (yield* Effect.promise(() => SandboxPreference.read(directory)) ?? false)
-    const limits = stored ?? {
-      mode: "deny" as const,
+    const limits: SandboxStore.Snapshot = stored ?? {
+      enabled: false,
+      mode: "deny",
       allowedHosts: [],
       writablePaths: [],
       audit: false,
+      version: 0,
     }
     const gateAssessment = yield* SandboxGate.assess()
     const support = backendSupport({ mode: limits.mode, allowedHosts: limits.allowedHosts })
@@ -165,13 +169,7 @@ export namespace SandboxTerminal {
     // take, streamed (output forwarded live; input and resize degraded).
     const launch = yield* Effect.scoped(
       confine(
-        profile(
-          directory,
-          limits.mode,
-          limits.allowedHosts,
-          (limits as { allowedCidrs?: Profile["network"]["allowedCidrs"] }).allowedCidrs,
-          (stored?.relaxations ?? []) as ReadonlyArray<Relaxation>,
-        ),
+        profile(directory, limits.mode, limits.allowedHosts, limits.allowedCidrs, stored?.relaxations ?? []),
         { command: input.command, args: input.args, cwd: input.cwd || input.directory, environment: input.env, stream: true },
       ),
     )

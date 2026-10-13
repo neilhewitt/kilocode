@@ -28,7 +28,17 @@ export type RunEgress =
   | { readonly default: "allow" }
   | { readonly default: "deny" }
   | { readonly default: "proxy"; readonly allowedHosts: ReadonlyArray<string> }
-  | { readonly default: "cidr"; readonly allow: ReadonlyArray<CidrPortRule> }
+  | {
+      readonly default: "cidr"
+      readonly allow: ReadonlyArray<CidrPortRule>
+      // Set by the translating backend only when a non-empty allowed_cidrs
+      // relaxation REPLACED a proxy posture that carried an allowlist: MXC
+      // rejects direct rules alongside a proxy, so those hostnames stopped
+      // flowing with this run. The sidecar echoes the switch into the run's
+      // warnings so the narrowing is never silent. Not engine policy — the
+      // SDK request is composed from the posture alone.
+      readonly switchedFromProxy?: ReadonlyArray<string> | undefined
+    }
 
 // The UI posture of the run. `disable` is the MXC kill switch for the GUI
 // subsystem; it must stay false for ordinary development tooling (node, git,
@@ -150,8 +160,11 @@ function isEgress(value: unknown): value is RunEgress {
       return true
     case "proxy":
       return isStringArray(value["allowedHosts"])
-    case "cidr":
-      return Array.isArray(value["allow"]) && value["allow"].length > 0 && value["allow"].every(isCidrRule)
+    case "cidr": {
+      if (!Array.isArray(value["allow"]) || value["allow"].length === 0 || !value["allow"].every(isCidrRule)) return false
+      const switched = value["switchedFromProxy"]
+      return switched === undefined || isStringArray(switched)
+    }
     default:
       return false
   }

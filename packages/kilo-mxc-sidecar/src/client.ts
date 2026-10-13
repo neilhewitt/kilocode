@@ -91,7 +91,11 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
   let next = 0
   let buffer = ""
   let closed = false
-  const waiting = new Map<number, { resolve: (result: any) => void; reject: (err: Error) => void }>()
+  // Pending calls are heterogeneous (each caller types its own result), so the
+  // stored resolver carries the raw wire value; the caller settles it as its
+  // typed T.
+  type Waiter = { resolve: (value: unknown) => void; reject: (err: Error) => void }
+  const waiting = new Map<number, Waiter>()
   // A sidecar that dies mid-request must never hang its caller: pending calls
   // settle with a rejection when the connection goes away, and any call made
   // after it is gone rejects instead of waiting forever.
@@ -142,7 +146,7 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
       }
       const requestId = ++next
       if (output) outputs.set(requestId, output)
-      waiting.set(requestId, { resolve: resolve as (result: any) => void, reject })
+      waiting.set(requestId, { resolve: resolve as (value: unknown) => void, reject })
       socket.write(JSON.stringify({ id: requestId, method, ...extra }) + "\n")
     })
 

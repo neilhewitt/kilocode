@@ -37,21 +37,43 @@ async function ensureSession(api: TuiPluginApi) {
   return sessionID
 }
 
-// Resolves a host-gate refusal through the sandbox gate route. The typed SDK
-// client gains this endpoint at the next sdk regeneration; until then the call
-// rides the client's own connection config so auth and base URL stay correct.
-async function resolveGate(api: TuiPluginApi, sessionID: string, choice: "abort" | "continue-unsandboxed") {
+// The sandbox routes' base URL and headers. The typed SDK client gains the
+// gate and relax endpoints at the next sdk regeneration; until then the calls
+// ride the client's own connection config so auth and base URL stay correct.
+function sandboxRoute(api: TuiPluginApi) {
   const client = (api.client as unknown as {
     client: { getConfig: () => { baseUrl?: string; headers?: Record<string, string> } }
   }).client.getConfig()
   const baseUrl = client.baseUrl?.replace(/\/$/, "")
-  if (!baseUrl) throw new Error("cannot resolve the sandbox gate without a server connection")
-  const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionID)}/sandbox/gate`, {
+  if (!baseUrl) throw new Error("cannot reach the sandbox routes without a server connection")
+  return { baseUrl, headers: client.headers }
+}
+
+// Resolves a host-gate refusal through the sandbox gate route.
+async function resolveGate(api: TuiPluginApi, sessionID: string, choice: "abort" | "continue-unsandboxed") {
+  const route = sandboxRoute(api)
+  const response = await fetch(`${route.baseUrl}/session/${encodeURIComponent(sessionID)}/sandbox/gate`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...client.headers },
+    headers: { "content-type": "application/json", ...route.headers },
     body: JSON.stringify({ choice }),
   })
   if (!response.ok) throw new Error(`sandbox gate resolution failed: ${response.status} ${await response.text()}`)
+  return (await response.json()) as Status
+}
+
+// Grants a relaxation through the session relax seam (the surface the
+// permission prompt and the PTY surface plug into as well). The request is
+// posted as-is; the seam validates it and records the grant in the session
+// log with its source ("prompt"), so this dialog only ever supplies the
+// request — never a record.
+async function applyRelaxation(api: TuiPluginApi, sessionID: string, request: unknown) {
+  const route = sandboxRoute(api)
+  const response = await fetch(`${route.baseUrl}/session/${encodeURIComponent(sessionID)}/sandbox/relax`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...route.headers },
+    body: JSON.stringify(request),
+  })
+  if (!response.ok) throw new Error(`sandbox relaxation failed: ${response.status} ${await response.text()}`)
   return (await response.json()) as Status
 }
 
@@ -161,6 +183,73 @@ const tui: TuiPlugin = async (api) => {
     )
   }
 
+  // Offers the relaxation kinds the session can grant through the relax seam:
+  // a path grant (read or write, typed by the user) or the PTY terminal kind.
+  // Every grant lands on SandboxPolicy.relax and is recorded with source
+  // "prompt"; an identical grant composes once. Grants are session-only —
+  // they never seed the next session or touch durable config.
+  const offerRelaxation = (sessionID: string) => {
+    const grant = async (request: unknown) => {
+      api.ui.dialog.clear()
+      try {
+        const value = await applyRelaxation(api, sessionID, request)
+        set(sessionID, value)
+        api.ui.toast({
+          message: "Relaxation granted for this session — recorded in the session log",
+          variant: "warning",
+          duration: 8000,
+        })
+      } catch (err) {
+        api.ui.toast({ message: String(err), variant: "error", duration: 5000 })
+      }
+    }
+    api.ui.dialog.replace(
+      () => (
+        <api.ui.Dialog onClose={() => api.ui.dialog.clear()}>
+          <api.ui.DialogSelect
+            title="Grant a sandbox relaxation (session-only)"
+            skipFilter={true}
+            options={[
+              {
+                title: "Read a directory",
+                description: "Grant read access to one directory for this session only.",
+                value: "read",
+              },
+              {
+                title: "Write a directory",
+                description: "Grant read-write access to one directory for this session only.",
+                value: "write",
+              },
+              {
+                title: "Real PTY for the next terminal",
+                description: "Bless one new terminal spawn to run unsandboxed, then the grant is spent.",
+                value: "terminal",
+              },
+            ]}
+            onSelect={async (option) => {
+              const kind = option.value as "read" | "write" | "terminal"
+              if (kind === "terminal") return void grant({ kind: "terminal" })
+              api.ui.dialog.replace(
+                () => (
+                  <api.ui.Dialog onClose={() => api.ui.dialog.clear()}>
+                    <api.ui.DialogPrompt
+                      title={kind === "read" ? "Directory to grant read access" : "Directory to grant read-write access"}
+                      placeholder="C:\Users\you\project"
+                      onConfirm={(value) => void grant({ kind: "path", access: kind, path: value })}
+                      onCancel={() => api.ui.dialog.clear()}
+                    />
+                  </api.ui.Dialog>
+                ),
+                () => api.ui.dialog.clear(),
+              )
+            }}
+          />
+        </api.ui.Dialog>
+      ),
+      () => api.ui.dialog.clear(),
+    )
+  }
+
   api.keymap.registerLayer({
     commands: [
       {
@@ -189,6 +278,18 @@ const tui: TuiPlugin = async (api) => {
           } finally {
             pending.delete(sessionID)
           }
+        },
+      },
+      {
+        namespace: "palette",
+        name: "session.sandbox.relax",
+        title: "Grant sandbox relaxation",
+        category: "Session",
+        slashName: "sandbox-relax",
+        async run() {
+          const sessionID = await ensureSession(api)
+          if (!sessionID) return
+          offerRelaxation(sessionID)
         },
       },
     ],

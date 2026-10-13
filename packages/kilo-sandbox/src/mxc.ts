@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync } from "node:fs"
+import { existsSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { Effect, PlatformError } from "effect"
@@ -137,11 +137,13 @@ function distinct(paths: ReadonlyArray<string>) {
   return keep
 }
 
-function list(dir: string) {
+// A directory listing; an unreadable directory yields undefined instead of a
+// silent empty list, so the secret sweep can see the gap it could not bridge.
+function list(dir: string): ReadonlyArray<Dirent> | undefined {
   try {
     return readdirSync(dir, { withFileTypes: true })
   } catch {
-    return []
+    return undefined
   }
 }
 
@@ -150,34 +152,90 @@ function list(dir: string) {
 // Directories are never blanket-denied by name: `.git` and friends stay under
 // their parent grant so VCS metadata keeps working (git must operate under the
 // default table); credential-store directories are denied explicitly instead.
-// The scan is bounded by host readability: a directory the host-side scan
-// cannot enumerate is skipped, so a deny-named file hidden inside it would not
-// be denied — unlike the Bubblewrap backend, which fail-closes by re-binding
-// such a directory read-only. Only reachable through ACL anomalies inside an
-// already-writable workspace; recorded as a known caveat of the win32 mapping.
-function scan(root: string, names: ReadonlySet<string>, found: Set<string>) {
+//
+// The sweep is honest about its reach, and fails closed on what it cannot
+// bridge:
+// - A directory it cannot enumerate (ACL anomaly, dangling junction) is
+//   denied OUTRIGHT — reported to the table as a literal denied path, never
+//   silently skipped, so a deny-named file hidden inside cannot be missed
+//   because the whole directory is unreachable. The Bubblewrap backend
+//   fail-closes exactly such a directory by re-binding it read-only; a
+//   literal path denial is the MXC equivalent, and the engine carries literal
+//   denials that do not resolve as files (the credential stores already rely
+//   on that for paths that exist only as future stores).
+// - A directory reached through a junction/symlink is swept too, never
+//   skipped for being a link: deny-named files behind in-grant links are
+//   found. Cycles and re-joins are bounded by the set of canonical paths
+//   already visited.
+//
+// Residual fail-open, recorded as an engine limitation: deniedPaths is a
+// composition-time LITERAL list — the engine has no name rules — so a
+// deny-named file created after this table was composed stays readable for
+// the in-flight run; the next command composes a fresh table that denies it.
+// Absent deny-named paths cannot be pre-denied, because a name does not say
+// whether the path will be a file or a directory (`.git` is precisely that
+// ambiguity); the credential stores are the bounded exception, where the
+// names are known to be directories.
+function scan(root: string, names: ReadonlySet<string>, found: Set<string>, unreachable: Set<string>) {
   const pending = [root]
+  const visited = new Set<string>()
   while (pending.length > 0) {
     const dir = pending.pop()
     if (!dir) continue
-    for (const entry of list(dir)) {
+    const canonical = canonicalise(dir)
+    if (visited.has(canonical)) continue
+    visited.add(canonical)
+    const entries = list(dir)
+    if (entries === undefined) {
+      unreachable.add(dir)
+      continue
+    }
+    for (const entry of entries) {
       const target = path.join(dir, entry.name)
       const name = caseInsensitive ? entry.name.toLowerCase() : entry.name
       const match = caseInsensitive ? [...names].some((n) => n.toLowerCase() === name) : names.has(entry.name)
-      if (match && entry.isFile()) found.add(target)
-      if (entry.isDirectory()) pending.push(target)
+      // Links are followed for the walk — the confined process resolves them
+      // too, so skipping them by name would just move the gap behind the
+      // link. What the link resolves to decides file, directory, or nothing
+      // at all.
+      const resolved = entry.isSymbolicLink() ? statSync(target, { throwIfNoEntry: false }) : undefined
+      const kind = entry.isFile() || resolved?.isFile()
+        ? "file"
+        : entry.isDirectory() || resolved?.isDirectory()
+          ? "dir"
+          : undefined
+      if (kind === undefined) {
+        // Not classifiable — a dangling link above all: nothing the sweep can
+        // name underneath, so nothing is proven clean. Denied outright in the
+        // fail-closed direction.
+        unreachable.add(target)
+        continue
+      }
+      if (match && kind === "file") found.add(target)
+      if (kind === "dir") pending.push(target)
     }
   }
 }
 
+function canonicalise(value: string) {
+  try {
+    return realpathSync.native(value)
+  } catch {
+    return value
+  }
+}
+
+// The literal denials the sweep can honestly name: every deny-named file it
+// found, and every directory it could not enumerate, denied outright.
 function deniedNames(profile: Profile, allow: ReadonlyArray<PathRule>) {
   if (profile.filesystem.denyNames.length === 0) return []
   const names = new Set(profile.filesystem.denyNames)
   const found = new Set<string>()
+  const unreachable = new Set<string>()
   for (const rule of allow) {
-    if (rule.kind === "subtree") scan(rule.path, names, found)
+    if (rule.kind === "subtree") scan(rule.path, names, found, unreachable)
   }
-  return [...found].sort((a, b) => a.length - b.length)
+  return [...found, ...unreachable].sort((a, b) => a.length - b.length)
 }
 
 // The proxy environment names are stripped from every confined environment:
@@ -222,10 +280,19 @@ function safeEnvironment(environment: Launch["environment"]) {
 // rejects direct rules alongside a proxy, so a profile carrying raw CIDR/port
 // rules runs on those rules alone; otherwise proxy mode rides the sidecar's
 // loopback proxy with the normalised hostname allowlist (an empty list is a
-// deliberate deny-all), deny stays Model 3, and allow is unrestricted.
+// deliberate deny-all), deny stays Model 3, and allow is unrestricted. When
+// the relaxations replace a proxy posture that carried an allowlist, the
+// hostnames silently stop flowing — the switch is marked on the posture so
+// the sidecar warns about it in the run's result, never silent.
 function egressOf(network: Profile["network"]): RunEgress {
   const relaxations: ReadonlyArray<CidrPortRule> = network.allowedCidrs ?? []
-  if (relaxations.length > 0) return { default: "cidr", allow: relaxations }
+  if (relaxations.length > 0) {
+    const allowlist = normalizeDestinations(network.allowedHosts)
+    if (network.mode === "proxy" && allowlist.length > 0) {
+      return { default: "cidr", allow: relaxations, switchedFromProxy: allowlist }
+    }
+    return { default: "cidr", allow: relaxations }
+  }
   if (network.mode === "allow") return { default: "allow" }
   if (network.mode === "proxy") return { default: "proxy", allowedHosts: normalizeDestinations(network.allowedHosts) }
   return { default: "deny" }
@@ -275,13 +342,10 @@ export function translate(profile: Profile, launch: Launch): RunCommand {
   const relaxedRead = relaxations.filter((entry) => entry.access === "read").map((entry) => entry.path)
   // A write relaxation is a read-write grant: it joins the allow list before
   // composition so ancestor generation and the readonly defaults treat it as
-  // the workspace grant it is.
-  const allow = distinct(
-    [...profile.filesystem.allowWrite, ...relaxedWrite.map((path) => ({ path, kind: "subtree" as const }))]
-      .filter(exists)
-      .map((rule) => rule.path)
-      .sort((a, b) => a.length - b.length),
-  )
+  // the workspace grant it is. The granted (live) subtrees are shared with
+  // the deny-name sweep one composition below.
+  const grantedSubtrees = [...profile.filesystem.allowWrite, ...relaxedWrite.map((path) => ({ path, kind: "subtree" as const }))].filter(exists)
+  const allow = distinct(grantedSubtrees.map((rule) => rule.path).sort((a, b) => a.length - b.length))
   const temporary = profile.filesystem.temporaryDirectory
   const readwrite = temporary && existsSync(temporary) && !allow.includes(temporary) ? [...allow, temporary] : allow
   const readonlyBase = distinct([
@@ -305,7 +369,7 @@ export function translate(profile: Profile, launch: Launch): RunCommand {
   // store or a deny-named file the grant table had blocked — while every other
   // denial stands. Nothing else changes: a read relaxation grants read, never
   // write, and the profile around a relaxed store stays read-only.
-  const denied = distinct([...deniedNames(profile, [...profile.filesystem.allowWrite, ...relaxedWrite.map((path) => ({ path, kind: "subtree" as const }))].filter(exists)), ...deniedCredentials(launch.environment)]).filter(
+  const denied = distinct([...deniedNames(profile, grantedSubtrees), ...deniedCredentials(launch.environment)]).filter(
     (entry) => !relaxedRead.some((read) => sameOrUnder(entry, read)),
   )
   return {
@@ -336,7 +400,7 @@ export function translate(profile: Profile, launch: Launch): RunCommand {
   }
 }
 
-export function supportFor(platform: string, network?: Profile["network"]): Support {
+export function supportFor(platform: string, _network?: Profile["network"]): Support {
   if (platform !== "win32") return { available: false, reason: "The MXC sandbox backend requires Windows" }
   return { available: true }
 }

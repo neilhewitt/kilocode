@@ -1,7 +1,7 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 import { spawn, spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { lookup } from "node:dns/promises"
 import { connect } from "node:net"
 import os from "node:os"
@@ -86,6 +86,47 @@ describe("mxc policy translation", () => {
       assert.ok(!request.filesystem.deniedPaths.some((entry) => entry.endsWith(".gitconfig")), "non-matching names are not denied")
     } finally {
       rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("the sweep fails closed on a granted directory it cannot enumerate", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-sweep-gap-"))
+    try {
+      // A dangling junction inside the granted workspace: the host cannot
+      // enumerate it, so the sweep cannot tell what hides behind it — the
+      // honest answer is to deny the whole directory outright, not silently
+      // skip it and hope.
+      symlinkSync(path.join(root, "gone-target"), path.join(root, "linked"), "junction")
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [".env"], temporaryDirectory: undefined } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.ok(
+        request.filesystem.deniedPaths.includes(path.join(root, "linked")),
+        "the unenumerable directory is denied outright instead of silently skipped",
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("the sweep finds deny-named files behind junction links instead of skipping links", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-sweep-link-"))
+    const store = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-sweep-link-store-"))
+    try {
+      writeFileSync(path.join(store, ".env"), "SECRET=1")
+      symlinkSync(store, path.join(root, "linked"), "junction")
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [".env"], temporaryDirectory: undefined } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.ok(
+        request.filesystem.deniedPaths.includes(path.join(root, "linked", ".env")),
+        "a deny-named file behind an in-grant link is found and denied",
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(store, { recursive: true, force: true })
     }
   })
 
@@ -321,19 +362,31 @@ describe("mxc policy translation", () => {
         { to: ["10.0.0.0/8"] },
       ]
       // A relaxation governs even a proxy-mode profile: MXC rejects direct
-      // rules alongside a proxy, so the recorded rules stand alone.
+      // rules alongside a proxy, so the recorded rules stand alone — and the
+      // allowlist they replaced is named on the posture, so the sidecar can
+      // warn that those hostnames stopped flowing instead of the switch
+      // staying silent.
       const proxied = translate(
         profile(root, {
           network: { mode: "proxy", allowedHosts: ["example.com:443"], allowedCidrs: relaxations },
         }),
         launch(root),
       )
-      assert.deepEqual(proxied.network, { egress: { default: "cidr", allow: relaxations } })
+      assert.deepEqual(proxied.network, {
+        egress: { default: "cidr", allow: relaxations, switchedFromProxy: ["example.com:443"] },
+      })
+      // A posture with no allowlist behind it (deny mode, or a proxy posture
+      // trimmed to an empty list) drops nothing that used to flow.
       const denied = translate(
         profile(root, { network: { mode: "deny", allowedHosts: [], allowedCidrs: relaxations } }),
         launch(root),
       )
       assert.deepEqual(denied.network, { egress: { default: "cidr", allow: relaxations } })
+      const trimmed = translate(
+        profile(root, { network: { mode: "proxy", allowedHosts: [], allowedCidrs: relaxations } }),
+        launch(root),
+      )
+      assert.deepEqual(trimmed.network, { egress: { default: "cidr", allow: relaxations } })
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

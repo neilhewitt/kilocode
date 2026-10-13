@@ -28,8 +28,13 @@ import type { Profile, Relaxation } from "../src/profile.ts"
 // session-log records of those grants are pinned at the session seam in
 // packages/opencode/test/kilocode/sandbox/relaxation-logging.test.ts (bun
 // runner — CI) because the session audit JSONL lives in the opencode layer.
-// PERF-* asserts the ticket's per-command overhead budget from the spec's
-// Testing Decisions (documented ~30 ms SDK-baseline ceiling, generous margin).
+// PERF-* keeps a per-command overhead ceiling as a regression guard only.
+// It is NOT the spec's budget: the spec's Testing Decisions name a ~30 ms
+// bare-SDK baseline, which the full stack (run-shim + transient sidecar +
+// control round trip) does not meet — measured full-stack overhead is
+// ~440-470 ms median per trivial confined command. The session-scoped
+// sidecar is the recorded optimisation follow-up; until then the ceiling
+// below only trips loudly on a real slowdown, never flatters the stack.
 //
 // Every live test is probe-gated: the capability matrix below classifies the
 // host once and every cell either matches its assertions to what this host can
@@ -269,15 +274,16 @@ describe("seam 3 enforcement suite (probe-gated)", () => {
     }
   })
 
-  // The per-command overhead budget (spec, Testing Decisions): a trivial
-  // confined command must complete within a documented ceiling. The measured
-  // baseline is ~30 ms for a bare MXC SDK spawn (mxc-terminal-spike facts);
-  // the full stack adds the shim's transient sidecar and the control round
-  // trip, so the budget uses a generous margin for host variance around that
-  // baseline — CONFINED_COMMAND_BUDGET_MS below is the documented figure, and
-  // this cell fails loudly before a real slowdown could ship. Samples are
-  // medians of repeated runs; every sample is emitted as a diagnostic so the
-  // observed numbers stay attributable in the run output.
+  // The per-command overhead ceiling — a regression guard, NOT the spec's
+  // budget. The spec's Testing Decisions name a ~30 ms bare-SDK baseline
+  // (mxc-terminal-spike facts); the full stack adds the shim's transient
+  // sidecar and the control round trip, and measures ~440-470 ms median per
+  // trivial confined command. CONFINED_COMMAND_BUDGET_MS below asserts only
+  // that a held ceiling keeps holding, so a real slowdown trips loudly before
+  // shipping; the session-scoped sidecar is the recorded optimisation
+  // follow-up that would move the stack towards the bare-SDK baseline.
+  // Samples are medians of repeated runs; every sample is emitted as a
+  // diagnostic so the observed numbers stay attributable in the run output.
   const CONFINED_COMMAND_BUDGET_MS = 1_000
   const PERF_SAMPLES = 5
   test("PERF-BUDGET-01: a trivial confined command's spawn-to-completion stays within the documented budget", async (t) => {
@@ -296,10 +302,10 @@ describe("seam 3 enforcement suite (probe-gated)", () => {
         t.diagnostic(`PERF sample ${index + 1}/${PERF_SAMPLES}: ${sample.elapsed.toFixed(1)} ms spawn-to-completion`)
       }
       const median = [...samples].sort((a, b) => a - b)[Math.floor(samples.length / 2)]
-      t.diagnostic(`PERF median: ${median.toFixed(1)} ms (budget: ${CONFINED_COMMAND_BUDGET_MS} ms)` + ` samples: ${samples.map((value) => value.toFixed(0)).join(", ")}`)
+      t.diagnostic(`PERF median: ${median.toFixed(1)} ms (guard ceiling: ${CONFINED_COMMAND_BUDGET_MS} ms, not the spec budget) samples: ${samples.map((value) => value.toFixed(0)).join(", ")}`)
       assert.ok(
         median <= CONFINED_COMMAND_BUDGET_MS,
-        `per-command overhead ${median.toFixed(1)} ms exceeds the documented budget ${CONFINED_COMMAND_BUDGET_MS} ms — regressions must be investigated before shipping`,
+        `per-command overhead ${median.toFixed(1)} ms exceeds the regression-guard ceiling ${CONFINED_COMMAND_BUDGET_MS} ms — the spec's ~30 ms bare-SDK budget is not met by the full stack; regressions must be investigated before shipping`,
       )
     } finally {
       rmSync(root, { recursive: true, force: true })

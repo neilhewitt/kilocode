@@ -2,12 +2,14 @@
 // own loopback egress proxy for exactly the run's lifetime — the allowlist is
 // per-command policy, so proxies are never shared between runs — and every
 // raw CIDR/port relaxation is recorded in the warnings the caller sees, so the
-// deliberate widening is visible in the command's captured output. The proxy's
-// lifecycle rides the sidecar: kills, shutdown, and sidecar exit all release
-// every listener this wrapper started.
+// deliberate widening is visible in the command's captured output. A cidr
+// posture that replaced a proxy+allowlist one is warned about too: the
+// hostnames the allowlist used to serve stopped flowing, silently by default.
+// The proxy's lifecycle rides the sidecar: kills, shutdown, and sidecar exit
+// all release every listener this wrapper started.
 
 import { createEgressProxy, type EgressProxy } from "./proxy.ts"
-import type { CidrPortRule, RunCommand, RunHandle, RunResult } from "./run.ts"
+import type { CidrPortRule, RunCommand, RunEgress, RunHandle, RunResult } from "./run.ts"
 import type { RunBindings, RunOptions, Runtime } from "./sdk.ts"
 
 export type EgressRuntime = Runtime & {
@@ -29,6 +31,17 @@ function relaxationWarnings(rules: ReadonlyArray<CidrPortRule>): string[] {
   })
 }
 
+// A cidr posture that replaced a proxy+allowlist one narrowed the run: those
+// hostnames stopped flowing, so the switch is named in the run's warnings
+// beside the relaxation record itself.
+function postureSwitchWarnings(egress: Extract<RunEgress, { default: "cidr" }>): string[] {
+  const dropped = egress.switchedFromProxy
+  if (dropped === undefined || dropped.length === 0) return []
+  return [
+    `egress posture switch: raw CIDR relaxations replace the proxy allowlist for this run — these hostnames no longer flow: ${dropped.join(", ")}`,
+  ]
+}
+
 export function withEgressProxy(runtime: Runtime): EgressRuntime {
   const live = new Set<EgressProxy>()
 
@@ -42,7 +55,8 @@ export function withEgressProxy(runtime: Runtime): EgressRuntime {
 
   const relaxationsFor = (command: RunCommand): string[] => {
     const egress = command.network.egress
-    return egress.default === "cidr" ? relaxationWarnings(egress.allow) : []
+    if (egress.default !== "cidr") return []
+    return [...relaxationWarnings(egress.allow), ...postureSwitchWarnings(egress)]
   }
 
   const annotate = (handle: RunHandle, warnings: string[]): RunHandle => ({
