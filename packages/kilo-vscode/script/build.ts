@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { existsSync, mkdirSync, rmSync, chmodSync } from "node:fs"
 import {
   copyKiloSandboxWorker,
+  copyMxcSidecarUnit,
   copySandboxResources,
   copyTreeSitterResources,
 } from "../src/services/cli-backend/cli-resources"
@@ -84,6 +85,7 @@ for (const config of targets) {
   await copyTreeSitterResources(sourceBinary, targetBinary)
   await copySandboxResources(sourceBinary, targetBinary)
   await copyKiloSandboxWorker(sourceBinary, targetBinary)
+  await copyMxcSidecarUnit(sourceBinary, targetBinary)
 
   if (config.binary !== "kilo.exe") {
     chmodSync(targetBinary, 0o755)

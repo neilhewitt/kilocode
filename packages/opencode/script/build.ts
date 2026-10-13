@@ -21,6 +21,7 @@ import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
 // kilocode_change start
 import { stageBubblewrap } from "./kilocode/bubblewrap"
+import { stageMxcSidecarUnit } from "./kilocode/mxc-sidecar-unit"
 import { LanceDBRuntime } from "../src/kilocode/lancedb"
 import { KiloSandboxWorker } from "./kilocode/kilo-sandbox-worker"
 import { KiloSandboxNetwork } from "./kilocode/kilo-sandbox-network"
@@ -369,6 +370,10 @@ for (const item of targets) {
   if (item.os === "linux") {
     await KiloSandboxNetwork.copy(kiloSandboxNetwork, path.resolve(dir, `dist/${name}/bin`), item.arch)
   }
+  // kilocode_change - bundled MXC sidecar unit (ADR 0005): pinned Node + SDK +
+  // sidecar server beside the binary on Windows; skipped elsewhere or via
+  // KILO_SKIP_MXC_SIDECAR_UNIT=1.
+  await stageMxcSidecarUnit(item.os, item.arch, path.resolve(dir, `dist/${name}/bin`))
 
   if (item.os === "linux") {
     const interpreters: Record<string, string> = {
