@@ -20,6 +20,12 @@ describe("sandbox TUI", () => {
     ).toBe("△ UNSANDBOXED")
   })
 
+  test("signals an audit-mode session as unsandboxed while it authors a grant table", () => {
+    expect(
+      indicator({ directory: "/repo", enabled: false, available: true, audit: true, version: 4 }),
+    ).toBe("△ AUDIT — UNSANDBOXED")
+  })
+
   test("keeps the prompt status contribution mounted while inactive", () => {
     const content = fs.readFileSync(source, "utf8")
     expect(content).toContain("<box flexShrink={0}>")

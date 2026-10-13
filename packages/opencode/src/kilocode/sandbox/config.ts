@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { normalizeDestinations, parseDestination } from "@kilocode/sandbox"
+import { isRelaxation, normalizeDestinations, parseDestination, type Relaxation } from "@kilocode/sandbox"
 
 export namespace SandboxConfig {
   export const Network = Schema.Literals(["allow", "deny"])
@@ -15,6 +15,16 @@ export namespace SandboxConfig {
       }
     }),
   )
+
+  export const RelaxationEntry = Schema.Struct({
+    kind: Schema.Literals(["path", "terminal"]),
+    access: Schema.optional(Schema.Literals(["read", "write"])),
+    path: Schema.optional(Schema.String),
+    reason: Schema.optional(Schema.String),
+  }).annotate({
+    description:
+      "A deliberate widening of the grant table: a path relaxation grants read or write outside the default table; the terminal kind is the PTY relaxation hook",
+  })
 
   export const Info = Schema.Struct({
     enabled: Schema.optional(
@@ -33,6 +43,18 @@ export namespace SandboxConfig {
         description: "Exact network destinations sandboxed tools may access while network restriction is enabled",
       }),
     ),
+    relaxations: Schema.optional(
+      Schema.mutable(Schema.Array(RelaxationEntry)).annotate({
+        description:
+          "Durable relaxations applied to every session (config source); removing one restores the default table next session",
+      }),
+    ),
+    audit: Schema.optional(
+      Schema.Boolean.annotate({
+        description:
+          "Audit mode: commands run unsandboxed while every denial the grant table would have enforced is recorded in the session log",
+      }),
+    ),
   }).annotate({ description: "Sandbox configuration for agent tools" })
   export type Info = Schema.Schema.Type<typeof Info>
 
@@ -44,6 +66,9 @@ export namespace SandboxConfig {
       mode: restricted ? (hosts.length > 0 ? ("proxy" as const) : ("deny" as const)) : ("allow" as const),
       allowedHosts: restricted ? hosts : [],
       writablePaths: [...(config.sandbox?.writable_paths ?? [])],
+      // Fail-closed: a malformed config relaxation never reaches a table.
+      relaxations: (config.sandbox?.relaxations ?? []).filter(isRelaxation) as ReadonlyArray<Relaxation>,
+      audit: config.sandbox?.audit ?? false,
     }
   }
 

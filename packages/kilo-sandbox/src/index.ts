@@ -5,7 +5,9 @@ export { assertNetwork, assertSandbox, decorateHttpClient, httpLayer as networkH
 export { batchMutations, mutate, withRunner, type Runner as MutationRunner } from "./mutation"
 export type { Request as MutationRequest } from "./mutation-protocol"
 export { backendSupport, prepareCommand } from "./backend"
-export { mxcRuntime } from "./mxc"
+export { mxcRuntime, translate } from "./mxc"
+export type { AuditPosture, PathRelaxation, Relaxation, RelaxationAccess } from "./profile"
+export { isRelaxation, merged, pathRelaxations } from "./relaxation"
 export {
   ENFORCEMENT_FLOOR_DOC,
   ENFORCEMENT_FLOOR_TIER,

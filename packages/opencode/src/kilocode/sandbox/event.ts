@@ -12,6 +12,7 @@ export const Changed = BusEvent.define(
     reason: Schema.optional(Schema.String),
     diagnostics: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
     unsandboxed: Schema.optional(Schema.Boolean),
+    audit: Schema.optional(Schema.Boolean),
     version: Schema.Int,
   }),
 )

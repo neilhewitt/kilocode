@@ -28,6 +28,8 @@ function profile(root: string, overrides: Partial<Profile> = {}): Profile {
     },
     network: { mode: "deny", allowedHosts: [], ...overrides.network },
     environment: { deny: ["SECRET"], set: { KILO_SET: "1" } , ...overrides.environment },
+    ...(overrides.relaxations === undefined ? {} : { relaxations: overrides.relaxations }),
+    ...(overrides.audit === undefined ? {} : { audit: overrides.audit }),
   }
 }
 
@@ -317,6 +319,135 @@ describe("mxc policy translation", () => {
     const backslash = String.fromCharCode(92)
     assert.equal(quoteWindows(`end${backslash}"`), `"end${backslash.repeat(3)}""`)
     assert.equal(quoteWindows(""), '""')
+  })
+})
+
+describe("relaxation composition (ADR 0002)", () => {
+  test("a read relaxation un-denies a credential store while the profile stays read-only", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-cred-"))
+    const world = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-world-"))
+    try {
+      const home = path.join(world, "home")
+      mkdirSync(path.join(home, ".ssh"), { recursive: true })
+      const input = profile(root, {
+        filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined },
+        relaxations: [{ kind: "path", access: "read", path: path.join(home, ".ssh") }],
+      })
+      const env = { PATH: "", USERPROFILE: home }
+      const denied = translate(input, launch(root, { environment: env })).filesystem.deniedPaths
+      assert.ok(!denied.includes(path.join(home, ".ssh")), "a relaxed credential store is no longer denied")
+      for (const store of [".gnupg", ".aws", ".azure", ".kube"]) {
+        assert.ok(denied.includes(path.join(home, store)), `${store} stays denied`)
+      }
+      const relaxed = translate(input, launch(root, { environment: env }))
+      assert.ok(relaxed.filesystem.readonlyPaths.includes(home), "the user profile stays read-only — a read relaxation grants read, never write")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(world, { recursive: true, force: true })
+    }
+  })
+
+  test("a read relaxation un-denies exactly the relaxed deny-named file, and only when it covers the denial", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-name-"))
+    try {
+      mkdirSync(path.join(root, "a"))
+      mkdirSync(path.join(root, "b"))
+      writeFileSync(path.join(root, "a", ".env"), "SECRET=1")
+      writeFileSync(path.join(root, "b", ".env"), "SECRET=1")
+      const input = profile(root, {
+        filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [".env"], temporaryDirectory: undefined },
+        relaxations: [{ kind: "path", access: "read", path: path.join(root, "a", ".env") }],
+      })
+      const denied = translate(input, launch(root, { environment: { PATH: "" } })).filesystem.deniedPaths
+      assert.ok(!denied.includes(path.join(root, "a", ".env")), "the relaxed deny-named file is readable")
+      assert.ok(denied.includes(path.join(root, "b", ".env")), "an unrelaxed deny-named file stays denied")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a write relaxation grants the path read-write", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-write-"))
+    const extra = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-write-extra-"))
+    try {
+      const request = translate(
+        profile(root, {
+          filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined },
+          relaxations: [{ kind: "path", access: "write", path: extra }],
+        }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.ok(request.filesystem.readwritePaths.includes(extra), "the relaxed path is read-write")
+      assert.ok(
+        request.filesystem.readonlyPaths.includes(path.dirname(extra)),
+        "ancestors of the relaxed write grant stay read-only",
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(extra, { recursive: true, force: true })
+    }
+  })
+
+  test("a read relaxation outside every grant composes its own readonly grant", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-uncovered-"))
+    try {
+      const request = translate(
+        profile(root, {
+          filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined },
+          relaxations: [{ kind: "path", access: "read", path: "E:\\vault" }],
+        }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.ok(
+        request.filesystem.readonlyPaths.includes("E:\\vault"),
+        "a read relaxation on a path no grant covers composes its own readonly grant",
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a terminal relaxation and garbage entries compose nothing into the table", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-none-"))
+    try {
+      const bare = profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } })
+      const request = translate(
+        profile(root, {
+          filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined },
+          relaxations: [{ kind: "terminal" }, { kind: "path" } as never, { kind: "path", access: "write" } as never],
+        }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      const expected = translate(bare, launch(root, { environment: { PATH: "" } }))
+      assert.deepEqual(request.filesystem, expected.filesystem, "only well-formed path relaxations widen a table")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("audit request composition (ADR 0002)", () => {
+  test("an audit posture maps onto the run's allow-capture request", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-audit-req-"))
+    try {
+      const request = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined }, audit: { denialsPath: path.join(root, "denials.json") } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.deepEqual(request.audit, { denialsPath: path.join(root, "denials.json") })
+      const bare = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined }, audit: {} }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.deepEqual(bare.audit, {}, "an audit posture without a denials path still asks the engine to capture at its default destination")
+      const off = translate(
+        profile(root, { filesystem: { allowWrite: [{ path: root, kind: "subtree" }], denyWrite: [], denyNames: [], temporaryDirectory: undefined } }),
+        launch(root, { environment: { PATH: "" } }),
+      )
+      assert.equal(off.audit, undefined, "without an audit posture the run stays a plain confined execution")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 

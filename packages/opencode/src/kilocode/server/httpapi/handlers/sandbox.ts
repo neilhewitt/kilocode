@@ -58,5 +58,10 @@ export const sandboxHandlers = HttpApiBuilder.group(InstanceHttpApi, "sandbox", 
           Effect.andThen(SandboxPolicy.resolveGate(ctx.params.sessionID, ctx.payload.choice)),
         ),
       )
+      .handle("relax", (ctx: { params: { sessionID: SessionID }; payload: Record<string, unknown> }) =>
+        exists(ctx.params.sessionID).pipe(
+          Effect.andThen(SandboxPolicy.relax(ctx.params.sessionID, ctx.payload)),
+        ),
+      )
   }),
 )

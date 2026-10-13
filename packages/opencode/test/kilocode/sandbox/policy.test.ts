@@ -226,6 +226,22 @@ describe("sandbox policy", () => {
     expect(profile(ctx, "allow").network).toEqual({ mode: "allow", allowedHosts: [] })
   })
 
+  test("carries granted relaxations on the profile for table composition", async () => {
+    await using tmp = await fixture()
+    const dirs = tmp.extra
+    const ctx = context(dirs.a, dirs.a, dirs)
+
+    expect(profile(ctx).relaxations).toBeUndefined()
+    const relaxed = profile(ctx, "deny", undefined, [], [
+      { kind: "path", access: "read", path: path.join(dirs.approved, "secrets") },
+      { kind: "terminal" },
+    ])
+    expect(relaxed.relaxations).toEqual([
+      { kind: "path", access: "read", path: path.join(dirs.approved, "secrets") },
+      { kind: "terminal" },
+    ])
+  })
+
   test("keeps .git denied inside overlapping writable roots", async () => {
     await using tmp = await fixture()
     const dirs = tmp.extra

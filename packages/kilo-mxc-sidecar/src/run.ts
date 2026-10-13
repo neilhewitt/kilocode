@@ -18,6 +18,16 @@ export type RunUi = {
   readonly disable: boolean
 }
 
+// The audit request on a run: ask the MXC engine to allow-and-capture denials
+// (SDK captureDenials allow-mode) instead of enforcing them. `denialsPath`
+// names the destination file for the engine's denial report. The engine path
+// is the authoring surface behind a host switch; nothing sets it without the
+// caller explicitly opting in (ADR 0002: audit mode is signalled, never a
+// silent half-enforcement).
+export type RunAudit = {
+  readonly denialsPath?: string | undefined
+}
+
 export type RunCommand = {
   readonly command: string
   readonly workingDirectory?: string | undefined
@@ -31,6 +41,14 @@ export type RunCommand = {
   }
   readonly ui: RunUi
   readonly environment: Readonly<Record<string, string>>
+  readonly audit?: RunAudit | undefined
+}
+
+// The engine's denial-capture summary for a completed run. Present only when
+// the engine attached a captureDenials report.
+export type RunAuditResult = {
+  readonly totalDenials: number
+  readonly reportPath?: string | undefined
 }
 
 export type RunResult = {
@@ -39,6 +57,7 @@ export type RunResult = {
   readonly stderr: string
   readonly timedOut: boolean
   readonly warnings: ReadonlyArray<string>
+  readonly audit?: RunAuditResult | undefined
 }
 
 // A live execution inside the sidecar: `wait` settles with the captured result,
@@ -63,6 +82,15 @@ function isEgress(value: unknown): value is RunEgress {
   return egress === "allow" || egress === "deny"
 }
 
+function isAudit(value: unknown): value is RunAudit {
+  if (!isRecord(value)) return false
+  for (const key of Object.keys(value)) {
+    if (key !== "denialsPath") return false
+  }
+  const denialsPath = value["denialsPath"]
+  return denialsPath === undefined || typeof denialsPath === "string"
+}
+
 export function isRunCommand(value: unknown): value is RunCommand {
   if (!isRecord(value)) return false
   if (typeof value["command"] !== "string" || value["command"] === "") return false
@@ -79,5 +107,7 @@ export function isRunCommand(value: unknown): value is RunCommand {
   if (!isRecord(ui) || typeof ui["disable"] !== "boolean") return false
   const environment = value["environment"]
   if (!isRecord(environment) || Array.isArray(environment)) return false
+  const audit = value["audit"]
+  if (audit !== undefined && !isAudit(audit)) return false
   return Object.values(environment).every((entry) => typeof entry === "string")
 }

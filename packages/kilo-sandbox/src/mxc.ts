@@ -5,6 +5,7 @@ import { Effect, PlatformError } from "effect"
 import type { RunCommand } from "@kilocode/mxc-sidecar"
 import type { Backend, Launch, Support } from "./backend"
 import type { PathRule, Profile } from "./profile"
+import { pathRelaxations } from "./relaxation"
 
 // The Windows sandbox backend. Kilo's sandbox Profile is translated into an MXC
 // run request carried by the sidecar's launcher shim: prepare() rewrites the
@@ -238,31 +239,66 @@ function uiDefaults() {
 
 // Seam 1: the pure Profile → MXC request translation.
 export function translate(profile: Profile, launch: Launch): RunCommand {
+  const relaxations = pathRelaxations(profile.relaxations)
+  const relaxedWrite = relaxations.filter((entry) => entry.access === "write").map((entry) => entry.path)
+  const relaxedRead = relaxations.filter((entry) => entry.access === "read").map((entry) => entry.path)
+  // A write relaxation is a read-write grant: it joins the allow list before
+  // composition so ancestor generation and the readonly defaults treat it as
+  // the workspace grant it is.
   const allow = distinct(
-    profile.filesystem.allowWrite.filter(exists).map((rule) => rule.path).sort((a, b) => a.length - b.length),
+    [...profile.filesystem.allowWrite, ...relaxedWrite.map((path) => ({ path, kind: "subtree" as const }))]
+      .filter(exists)
+      .map((rule) => rule.path)
+      .sort((a, b) => a.length - b.length),
   )
   const temporary = profile.filesystem.temporaryDirectory
   const readwrite = temporary && existsSync(temporary) && !allow.includes(temporary) ? [...allow, temporary] : allow
-  const readonly = distinct([
+  const readonlyBase = distinct([
     ...profile.filesystem.denyWrite.filter(exists).map((rule) => rule.path),
     ...readwrite
       .flatMap((grant) => ancestors(grant))
       .filter((entry) => !readwrite.some((grant) => sameOrUnder(entry, grant))),
     ...readonlyDefaults(launch.environment, readwrite),
   ])
+  const readonly = distinct([
+    ...readonlyBase,
+    // A read relaxation on a path no grant covers composes its own readonly
+    // grant so the relaxed read actually reads.
+    ...relaxedRead.filter(
+      (entry) =>
+        !readwrite.some((grant) => sameOrUnder(entry, grant)) &&
+        !readonlyBase.some((rule) => sameOrUnder(entry, rule)),
+    ),
+  ])
+  // A read relaxation un-denies exactly the denials it covers — a credential
+  // store or a deny-named file the grant table had blocked — while every other
+  // denial stands. Nothing else changes: a read relaxation grants read, never
+  // write, and the profile around a relaxed store stays read-only.
+  const denied = distinct([...deniedNames(profile, [...profile.filesystem.allowWrite, ...relaxedWrite.map((path) => ({ path, kind: "subtree" as const }))].filter(exists)), ...deniedCredentials(launch.environment)]).filter(
+    (entry) => !relaxedRead.some((read) => sameOrUnder(entry, read)),
+  )
   return {
     command: commandLine(launch),
     ...(launch.cwd === undefined ? { workingDirectory: readwrite[0] } : { workingDirectory: launch.cwd }),
     filesystem: {
       readwritePaths: readwrite,
       readonlyPaths: readonly,
-      deniedPaths: distinct([...deniedNames(profile, profile.filesystem.allowWrite.filter(exists)), ...deniedCredentials(launch.environment)]),
+      deniedPaths: denied,
     },
     network: {
       egress: { default: profile.network.mode === "allow" ? "allow" : "deny" },
     },
     ui: uiDefaults(),
     environment: redirectCaches(safeEnvironment(launch.environment), temporary !== undefined && existsSync(temporary) ? temporary : undefined),
+    ...(profile.audit === undefined
+      ? {}
+      : {
+          audit: {
+            ...(profile.audit.denialsPath === undefined || profile.audit.denialsPath === ""
+              ? {}
+              : { denialsPath: profile.audit.denialsPath }),
+          },
+        }),
   }
 }
 

@@ -73,6 +73,14 @@ describe("run command contract", () => {
     assert.equal(isRunCommand(withoutUi), false, "the UI posture is part of the contract")
     assert.equal(isRunCommand(runCommand({ ui: { disable: "no" as unknown as boolean } })), false, "disable must be a boolean")
   })
+
+  test("accepts an optional audit request and rejects malformed ones", () => {
+    assert.equal(isRunCommand(runCommand({ audit: {} })), true, "an audit request may omit denialsPath")
+    assert.equal(isRunCommand(runCommand({ audit: { denialsPath: "C:\\logs\\denials.json" } })), true)
+    assert.equal(isRunCommand(runCommand({ audit: { denialsPath: 7 as unknown as string } })), false, "denialsPath must be a string")
+    assert.equal(isRunCommand(runCommand({ audit: { mode: "block" } as unknown as RunCommand["audit"] })), false, "mode is not part of the wire contract — allow-capture is the only audit posture")
+    assert.equal(isRunCommand(runCommand({ audit: "yes" as unknown as RunCommand["audit"] })), false)
+  })
 })
 
 describe("control channel run", () => {
@@ -157,6 +165,35 @@ describe("control channel run", () => {
       assert.deepEqual(result, canned)
     } finally {
       await sidecar.shutdown().catch(() => sidecar.stop())
+    }
+  })
+
+  test("round-trips an audit request and the engine capture report with a run", async () => {
+    const token = generateToken()
+    const canned: RunResult = {
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      warnings: [],
+      audit: { totalDenials: 3, reportPath: "C:\\logs\\denials.json" },
+    }
+    const { runtime, seen } = scripted(canned)
+    const server = createControlServer({ runtime, endpoint: controlEndpoint(id()), token })
+    await server.listen()
+    try {
+      const wire = await connect(server.endpoint)
+      wire.send({ id: 1, method: "handshake", token })
+      await wire.next()
+      const command = runCommand({ audit: { denialsPath: "C:\\logs\\denials.json" } })
+      wire.send({ id: 2, method: "run", run: command })
+      const response = JSON.parse(await wire.next())
+      assert.equal(response.ok, true)
+      assert.deepEqual(response.result, canned)
+      assert.deepEqual(seen, [command], "the audit request reaches the runtime untouched")
+      wire.socket.destroy()
+    } finally {
+      await server.stop()
     }
   })
 })

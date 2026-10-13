@@ -10,11 +10,13 @@ type Status = {
   reason?: string
   diagnostics?: string[]
   unsandboxed?: boolean
+  audit?: boolean
   version: number
 }
 
 export function indicator(status?: Status) {
   if (status?.enabled) return "◆ Sandbox on"
+  if (status?.audit) return "△ AUDIT — UNSANDBOXED"
   if (status?.unsandboxed) return "△ UNSANDBOXED"
   return undefined
 }
@@ -68,7 +70,7 @@ function View(props: {
   const colour = () => {
     const current = props.status().get(props.sessionID)
     if (current?.enabled) return props.api.theme.current.success
-    if (current?.unsandboxed) return props.api.theme.current.warning
+    if (current?.audit || current?.unsandboxed) return props.api.theme.current.warning
     return props.api.theme.current.success
   }
   return (

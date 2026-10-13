@@ -18,7 +18,6 @@ export type Runtime = {
   getPlatformSupport: () => Promise<PlatformSupport>
   run: (command: RunCommand) => Promise<RunHandle>
 }
-
 export const TELEMETRY_KEY_PATTERN = /telemetry/i
 
 export function sdkEnv(ambient: NodeJS.ProcessEnv, additions: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -40,6 +39,7 @@ type MxcChild = {
   standardError: NodeJS.ReadableStream | null
   wait: () => Promise<{ exitCode: number; timedOut: boolean }>
   warnings?: unknown
+  outputMetadata?: unknown
   kill: () => void
 }
 
@@ -54,11 +54,29 @@ function warningsOf(child: MxcChild): Array<string> {
   }
 }
 
+// The engine's audit posture for a run: allow-and-capture. The wire contract
+// carries allow-capture only — `mode: "block"` is enforced execution and is
+// not an audit surface, so it is never set here (and the wire rejects it).
+function containment(command: RunCommand): Record<string, unknown> {
+  if (command.audit === undefined) return { type: "processcontainer" }
+  return {
+    type: "processcontainer",
+    config: {
+      captureDenials: {
+        mode: "allow",
+        ...(command.audit.denialsPath === undefined || command.audit.denialsPath === ""
+          ? {}
+          : { outputPath: command.audit.denialsPath }),
+      },
+    },
+  }
+}
+
 export function toSdkRequest(command: RunCommand): Record<string, unknown> {
   return {
     command: command.command,
     ...(command.workingDirectory === undefined ? {} : { workingDirectory: command.workingDirectory }),
-    containment: { type: "processcontainer" },
+    containment: containment(command),
     filesystem: {
       readwritePaths: [...command.filesystem.readwritePaths],
       readonlyPaths: [...command.filesystem.readonlyPaths],
@@ -68,6 +86,26 @@ export function toSdkRequest(command: RunCommand): Record<string, unknown> {
     ui: { disable: command.ui.disable },
     environment: { ...command.environment },
     inheritDefaultEnvironment: true,
+  }
+}
+
+// The captureDenials summary a finished run exposes, extracted from the SDK's
+// output metadata. The SDK surface has drifted between method and getter
+// before (cf. warnings), so both shapes are read. A malformed or absent
+// report never masquerades as a capture: audit summaries must be complete or
+// missing, never invented.
+function auditOf(child: MxcChild): RunResult["audit"] {
+  const metadata =
+    typeof child.outputMetadata === "function" ? child.outputMetadata() : child.outputMetadata
+  if (typeof metadata !== "object" || metadata === null) return undefined
+  const capture = (metadata as Record<string, unknown>).captureDenials
+  if (typeof capture !== "object" || capture === null || Array.isArray(capture)) return undefined
+  const total = (capture as Record<string, unknown>).totalDenials
+  if (typeof total !== "number" || !Number.isSafeInteger(total)) return undefined
+  const report = (capture as Record<string, unknown>).outputPath
+  return {
+    totalDenials: total,
+    ...(typeof report === "string" && report !== "" ? { reportPath: report } : {}),
   }
 }
 
@@ -83,13 +121,17 @@ export function runThrough(sdk: Pick<SdkModule, "spawn">, command: RunCommand): 
     const stdout = collect(child.standardOutput)
     const stderr = collect(child.standardError)
     const wait = child.wait().then(
-      (result): RunResult => ({
-        exitCode: result.exitCode,
-        stdout: stdout(),
-        stderr: stderr(),
-        timedOut: result.timedOut,
-        warnings: warningsOf(child),
-      }),
+      (result): RunResult => {
+        const audit = auditOf(child)
+        return {
+          exitCode: result.exitCode,
+          stdout: stdout(),
+          stderr: stderr(),
+          timedOut: result.timedOut,
+          warnings: warningsOf(child),
+          ...(audit === undefined ? {} : { audit }),
+        }
+      },
     )
     return {
       wait: () => wait,

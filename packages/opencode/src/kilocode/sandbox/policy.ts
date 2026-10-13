@@ -4,7 +4,15 @@ import path from "node:path"
 import { Effect, Semaphore } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import { Database } from "@opencode-ai/core/database/database"
-import { backendSupport, deniedByProfile, run as runSandbox, unrestricted, type Profile } from "@kilocode/sandbox"
+import {
+  backendSupport,
+  deniedByProfile,
+  run as runSandbox,
+  translate,
+  unrestricted,
+  type Profile,
+  type Relaxation,
+} from "@kilocode/sandbox"
 import { Bus } from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import { Instance } from "@/kilocode/instance"
@@ -15,6 +23,7 @@ import type { SessionID } from "@/session/schema"
 import { Changed } from "./event"
 import * as SandboxGate from "./gate"
 import * as Network from "./network"
+import * as SandboxRelaxation from "./relaxation"
 import { SandboxPreference } from "./preference"
 import * as SandboxState from "./state"
 import { SandboxConfig } from "./config"
@@ -46,6 +55,7 @@ function limits(fallback: ReturnType<typeof SandboxConfig.resolve>) {
     writablePaths: fallback.writablePaths.map((value) =>
       value.startsWith("~") ? path.join(os.homedir(), value.slice(1)) : value,
     ),
+    audit: fallback.audit,
   }
 }
 
@@ -57,7 +67,8 @@ function matches(current: Snapshot, next: Snapshot) {
   return (
     current.mode === next.mode &&
     current.allowedHosts.join("\0") === next.allowedHosts.join("\0") &&
-    current.writablePaths.join("\0") === next.writablePaths.join("\0")
+    current.writablePaths.join("\0") === next.writablePaths.join("\0") &&
+    current.audit === next.audit
   )
 }
 
@@ -77,6 +88,8 @@ const publishChanged = Effect.fn("SandboxPolicy.publishChanged")(function* (sess
         available: merged.available,
         reason: merged.reason,
         diagnostics: [...merged.diagnostics],
+        unsandboxed: next.unsandboxed === true,
+        audit: next.audit === true,
         version: next.version,
       },
     },
@@ -105,6 +118,38 @@ const resolveInitial = Effect.fn("SandboxPolicy.resolveInitial")(function* (dire
   const fallback = SandboxConfig.resolve(cfg)
   return initial(chosen?.enabled, pref, fallback.enabled, fallback)
 })
+
+// The one command's relaxations: durable config entries first, then the
+// session's prompt-granted ones (ADR 0002). Durable relaxations are never
+// persisted — each command re-composes them from config, so removing one
+// restores the default table on the next session.
+function relaxationsFor(state: Snapshot, config: ReturnType<typeof SandboxConfig.resolve>) {
+  return SandboxRelaxation.effective(config.relaxations, state.relaxations)
+}
+
+// Durable config relaxations take effect with the session: each grant is
+// recorded once per session in the session log with its source (config).
+const logConfigRelaxations = Effect.fn("SandboxPolicy.logConfigRelaxations")(function* (
+  sessionID: SessionID,
+  state: Snapshot,
+) {
+  if (!state.enabled && state.audit !== true) return
+  if (!SandboxRelaxation.once(`config\0${sessionID}`)) return
+  const cfg = yield* (yield* Config.Service).get()
+  for (const entry of SandboxConfig.resolve(cfg).relaxations) {
+    yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, SandboxRelaxation.record(entry, "config")))
+  }
+})
+
+// Audit mode's engine path — MXC captureDenials allow-mode — is wired end to
+// end but crashes the SDK host process (0xC0000005) in MXC SDK 1.0.0 on a
+// live base-container host (verified in an isolated child; the byte-identical
+// request without captureDenials enforces cleanly). Until upstream fixes it,
+// audit sessions run on the unsandboxed dry-run path; a host with a fixed
+// engine opts in with KILO_MXC_AUDIT_ENGINE=1.
+function engineAudit() {
+  return process.env.KILO_MXC_AUDIT_ENGINE === "1"
+}
 function locked<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) {
   return Effect.acquireUseRelease(
     Effect.sync(() => {
@@ -234,6 +279,7 @@ export function profile(
   mode: Profile["network"]["mode"] = "deny",
   extraWritable?: readonly string[],
   allowedHosts: readonly string[] = [],
+  relaxations?: readonly Relaxation[],
 ): Profile {
   const project = isolated(ctx)
     ? [ctx.directory]
@@ -279,6 +325,7 @@ export function profile(
         TEMP: Global.Path.tmp,
       },
     },
+    ...(relaxations === undefined || relaxations.length === 0 ? {} : { relaxations }),
   }
 }
 
@@ -311,6 +358,7 @@ const snapshot = Effect.fn("SandboxPolicy.snapshot")(function* (sessionID: Sessi
       const id = key(directory, sessionID)
       snapshots.set(id, next)
       synced.set(id, version)
+      yield* logConfigRelaxations(sessionID, next)
       return { directory, state: next }
     }),
   )
@@ -346,13 +394,18 @@ export const status = Effect.fn("SandboxPolicy.status")(function* (sessionID: Se
   const support = backendSupport({ mode: active.state.mode, allowedHosts: active.state.allowedHosts })
   const merged = SandboxGate.fold(support, gate)
   const unsandboxed = active.state.unsandboxed === true
+  const audit = active.state.audit === true
   return {
     directory: active.directory,
     enabled: active.state.enabled && merged.available,
     available: merged.available,
-    reason: unsandboxed && !merged.available && merged.reason ? `${SandboxGate.UNSANDBOXED_SIGNAL}: ${merged.reason}` : merged.reason,
+    reason:
+      unsandboxed && !merged.available && merged.reason
+        ? `${SandboxGate.UNSANDBOXED_SIGNAL}: ${merged.reason}`
+        : merged.reason,
     diagnostics: [...merged.diagnostics],
     unsandboxed,
+    audit,
     version: active.state.version,
   }
 })
@@ -436,6 +489,7 @@ function change<E, R, F = never, Q = never, P = never, S = never>(
             const id = key(directory, sessionID)
             snapshots.set(id, next)
             synced.set(id, version)
+            if (enabling) yield* logConfigRelaxations(sessionID, next)
             if (enabling) {
               yield* Effect.forEach(
                 targets,
@@ -523,6 +577,49 @@ export const resolveGate = Effect.fn("SandboxPolicy.resolveGate")(function* (ses
 /** Stored confinement for a session in an explicit directory, without seeding from config. */
 export const peek = Effect.fn("SandboxPolicy.peek")(function* (directory: string, sessionID: SessionID) {
   return yield* read(directory, sessionID)
+})
+
+// The relaxation grant seam (ticket 15): the permission prompt, config, and
+// the PTY surface (ticket 17) all end here. A granted relaxation is stored
+// with the session snapshot — it applies to this session only and never
+// seeds the next one — and is recorded in the session log with its source
+// (prompt). Durable config relaxations never pass through here: they are
+// re-composed from config each command and logged once per session at init.
+export const relax = Effect.fn("SandboxPolicy.relax")(function* (sessionID: SessionID, request: unknown) {
+  if (!SandboxRelaxation.grantable(request)) {
+    return yield* Effect.fail(new Error("Invalid sandbox relaxation request"))
+  }
+  const gate = yield* SandboxGate.assess()
+  const directory = yield* InstanceState.directory
+  return yield* locked(
+    sessionID,
+    Effect.gen(function* () {
+      const stored = yield* read(directory, sessionID)
+      const base = stored ?? (yield* resolveInitial(directory, sessionID))
+      const { entries, added } = SandboxRelaxation.appended(base.relaxations ?? [], request)
+      const next: Snapshot = added ? { ...base, relaxations: entries, version: base.version + 1 } : base
+      if (added) {
+        yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
+        const id = key(directory, sessionID)
+        snapshots.set(id, next)
+        synced.set(id, revision)
+        yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, SandboxRelaxation.record(request, "prompt")))
+      }
+      const support = backendSupport({ mode: next.mode, allowedHosts: next.allowedHosts })
+      const merged = SandboxGate.fold(support, gate)
+      const value = {
+        directory,
+        enabled: next.enabled && merged.available,
+        available: merged.available,
+        reason: merged.reason,
+        unsandboxed: next.unsandboxed === true,
+        audit: next.audit === true,
+        version: next.version,
+      }
+      yield* Effect.promise(() => Bus.publish(Instance.current, Changed, { sessionID, ...value }))
+      return value
+    }),
+  )
 })
 
 function intersect(parent: Snapshot, child: Snapshot) {
@@ -666,6 +763,47 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
       1,
       Effect.gen(function* () {
         const active = yield* current(sessionID, true)
+        const config = SandboxConfig.resolve(yield* (yield* Config.Service).get())
+        const relaxations = relaxationsFor(active.state, config)
+        if (active.state.audit === true) {
+          // Audit mode (ADR 0002): commands run UNSANDBOXED while the table
+          // that would have governed them — grants, denials, egress — is
+          // composed per command and recorded in the session log under the
+          // unsandboxed signal. Grant-table authoring aid, never silent
+          // half-enforcement. The MXC engine's allow-capture path is wired
+          // behind KILO_MXC_AUDIT_ENGINE=1 for hosts with a fixed engine; on
+          // this SDK generation it crashes the host process (documented
+          // upstream blocker), so the default is the unsandboxed dry run.
+          const ctx = yield* InstanceState.context
+          const composed = profile(ctx, active.state.mode, active.state.writablePaths, active.state.allowedHosts, relaxations)
+          const table = translate(composed, { command: "", args: [], cwd: ctx.directory, environment: process.env })
+          yield* Effect.promise(() =>
+            SandboxStore.appendAudit(sessionID, {
+              type: "sandbox.audit.run",
+              sessionID,
+              directory: active.directory,
+              signal: `${SandboxGate.UNSANDBOXED_SIGNAL} (audit mode)`,
+              wouldEnforce: {
+                readwrite: table.filesystem.readwritePaths,
+                readonly: table.filesystem.readonlyPaths,
+                denied: table.filesystem.deniedPaths,
+                egress: table.network.egress.default,
+              },
+              relaxations,
+            }),
+          )
+          if (engineAudit()) {
+            const gate = yield* SandboxGate.assess()
+            const support = backendSupport({ mode: active.state.mode, allowedHosts: active.state.allowedHosts })
+            if (gate.verdict !== "refuse" && support.available) {
+              return yield* runSandbox(
+                { ...composed, audit: { denialsPath: SandboxStore.denialsPath(sessionID) } },
+                effect,
+              )
+            }
+          }
+          return yield* unrestricted(effect)
+        }
         if (!active.state.enabled) return yield* unrestricted(effect)
         const gate = yield* SandboxGate.assess()
         if (gate.verdict === "refuse") {
@@ -683,6 +821,7 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
             active.state.mode,
             active.state.writablePaths,
             active.state.allowedHosts,
+            relaxations,
           ),
           effect,
         )
