@@ -178,8 +178,14 @@ function shim() {
   return fileURLToPath(import.meta.resolve("@kilocode/mxc-sidecar/run-shim"))
 }
 
-function runtime() {
+// The bundled Node runtime that hosts the sidecar (ADR 0005). Shared by the
+// run shim and the read-only capability probe so both launch the same unit.
+export function mxcRuntime() {
   return process.env.KILO_MXC_NODE ?? process.execPath
+}
+
+function runtime() {
+  return mxcRuntime()
 }
 
 function setup(cause: unknown, launch: Launch) {

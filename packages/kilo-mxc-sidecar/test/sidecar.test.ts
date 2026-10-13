@@ -1,5 +1,9 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
+import { existsSync, readFileSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { startSidecar } from "../src/client.ts"
 import { connect, until } from "./wire.ts"
@@ -49,5 +53,50 @@ describe("sidecar process lifecycle", () => {
     sidecar.orphan()
     await until(() => sidecar.exited)
     assert.ok(true)
+  })
+})
+
+describe("sidecar platform support probing", () => {
+  test("answers a scripted non-enforcing tier with its warnings verbatim and never runs a command", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-probe-"))
+    const log = path.join(root, "events.jsonl")
+    const scripted = {
+      isSupported: true,
+      isolationTier: "appcontainer-dacl",
+      warnings: [
+        "HostPrepSystemDriveMissing: run wxc-host-prep prepare-system-drive once from an elevated context",
+        "HostPrepNullDeviceMissing: run wxc-host-prep prepare-null-device once per boot",
+      ],
+      source: "scripted",
+    }
+    try {
+      const sidecar = await startSidecar({
+        env: {
+          KILO_MXC_RUNTIME_MODULE: runtimeFixture,
+          KILO_MXC_SCRIPT_SUPPORT: JSON.stringify(scripted),
+          KILO_MXC_SCRIPT_EVENTS: log,
+        },
+      })
+      try {
+        await sidecar.handshake()
+        const support = await sidecar.platformSupport()
+        assert.deepEqual(support, scripted)
+      } finally {
+        await sidecar.shutdown().catch(() => sidecar.stop())
+      }
+      assert.equal(sidecar.exitCode, 0)
+      const recorded = existsSync(log)
+        ? (readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)) as Array<{
+            type: string
+          }>)
+        : []
+      assert.deepEqual(
+        recorded.map((entry) => entry.type),
+        ["platformSupport"],
+        "a probe consults platform support only — it must never launch a run",
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

@@ -5,5 +5,19 @@ export { assertNetwork, assertSandbox, decorateHttpClient, httpLayer as networkH
 export { batchMutations, mutate, withRunner, type Runner as MutationRunner } from "./mutation"
 export type { Request as MutationRequest } from "./mutation-protocol"
 export { backendSupport, prepareCommand } from "./backend"
+export { mxcRuntime } from "./mxc"
+export {
+  ENFORCEMENT_FLOOR_DOC,
+  ENFORCEMENT_FLOOR_TIER,
+  OFF_PLATFORM_ASSESSMENT,
+  assessPlatformSupport,
+  deniedByProfile,
+  probeMxcSupport,
+  type GateAssessment,
+  type GateDenials,
+  type GateSource,
+  type GateVerdict,
+  type ProbeOptions,
+} from "./probe"
 export { isPublicAddress, normalizeDestinations, parseDestination } from "./destination"
 export { CurrentProxyFactory, startProxy, type ProxyFactory, type ProxyResolver } from "./proxy"
