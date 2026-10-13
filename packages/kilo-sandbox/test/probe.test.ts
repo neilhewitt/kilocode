@@ -4,13 +4,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import type { Profile } from "../src/profile"
+import type { Profile } from "../src/profile.ts"
 import {
   ENFORCEMENT_FLOOR_DOC,
   assessPlatformSupport,
   deniedByProfile,
   probeMxcSupport,
-} from "../src/probe"
+} from "../src/probe.ts"
 
 // Ticket 14 — host gating. The capability probe gates sandbox mode: only the
 // base-container (PSEC) enforcement tier may confine; anything else is a hard

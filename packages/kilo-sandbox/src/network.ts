@@ -1,9 +1,9 @@
 import { Effect, Layer, PlatformError, Stream } from "effect"
 import { HttpClient, HttpClientError, HttpClientResponse, type HttpClientRequest } from "effect/unstable/http"
-import { current } from "./context"
+import { current } from "./context.ts"
 import type { Profile } from "./profile"
-import { currentProxy, type ProxyRuntime } from "./proxy"
-import { normalizeDestinations } from "./destination"
+import { currentProxy, type ProxyRuntime } from "./proxy.ts"
+import { normalizeDestinations } from "./destination.ts"
 
 const proxies = new Set([
   "HTTP_PROXY",

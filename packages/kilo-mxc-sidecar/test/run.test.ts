@@ -65,6 +65,67 @@ function id() {
   return Math.random().toString(16).slice(2, 10)
 }
 
+describe("run payload egress validation", () => {
+  test("accepts the four egress postures", () => {
+    const base = runCommand()
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "deny" } } }), true)
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "allow" } } }), true)
+    assert.equal(
+      isRunCommand({ ...base, network: { egress: { default: "proxy", allowedHosts: ["registry.npmjs.org:443"] } } }),
+      true,
+    )
+    assert.equal(
+      isRunCommand({
+        ...base,
+        network: {
+          egress: {
+            default: "cidr",
+            allow: [{ to: ["140.82.112.0/20"], ports: [{ protocol: "tcp", port: 443 }] }],
+          },
+        },
+      }),
+      true,
+    )
+  })
+
+  test("accepts a cidr rule without ports (every port) and with a range", () => {
+    const base = runCommand()
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "cidr", allow: [{ to: ["0.0.0.0/0"] }] } } }), true)
+    assert.equal(
+      isRunCommand({
+        ...base,
+        network: {
+          egress: { default: "cidr", allow: [{ to: ["10.0.0.0/8"], ports: [{ protocol: "udp", port: 53, endPort: 55 }] }] },
+        },
+      }),
+      true,
+    )
+  })
+
+  test("rejects a proxy egress without a string-array allowlist", () => {
+    const base = runCommand()
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "proxy" } } }), false)
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "proxy", allowedHosts: "registry.npmjs.org" } } }), false)
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "proxy", allowedHosts: [443] } } }), false)
+  })
+
+  test("rejects a cidr egress without a non-empty rule array", () => {
+    const base = runCommand()
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "cidr" } } }), false)
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "cidr", allow: [] } } }), false)
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "cidr", allow: [{ to: "10.0.0.0/8" }] } } }), false)
+    assert.equal(
+      isRunCommand({ ...base, network: { egress: { default: "cidr", allow: [{ to: [7], ports: [] }] } } }),
+      false,
+    )
+  })
+
+  test("rejects an unknown egress default", () => {
+    const base = runCommand()
+    assert.equal(isRunCommand({ ...base, network: { egress: { default: "open" } } }), false)
+  })
+})
+
 describe("run command contract", () => {
   test("accepts a run command with the UI posture and rejects one without it", () => {
     assert.equal(isRunCommand(runCommand()), true)

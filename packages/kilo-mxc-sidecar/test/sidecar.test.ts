@@ -54,6 +54,43 @@ describe("sidecar process lifecycle", () => {
     await until(() => sidecar.exited)
     assert.ok(true)
   })
+
+  test("rejects a pending call when the sidecar dies mid-request", async () => {
+    const sidecar = await startSidecar({ env: { KILO_MXC_RUNTIME_MODULE: runtimeFixture, KILO_MXC_SCRIPT_HANG: "1" } })
+    try {
+      await sidecar.handshake()
+      const run = sidecar.run({
+        command: "cmd /c echo hi",
+        filesystem: { readwritePaths: ["C:\\w"], readonlyPaths: [], deniedPaths: [] },
+        network: { egress: { default: "deny" } },
+        ui: { disable: false },
+        environment: {},
+      })
+      sidecar.stop()
+      const outcome = await Promise.race([
+        run.then(
+          () => "settled",
+          () => "rejected",
+        ),
+        new Promise<"hung">((resolve) => {
+          setTimeout(() => resolve("hung"), 2_000).unref()
+        }),
+      ])
+      assert.equal(outcome, "rejected", "a caller must learn that its run died with the sidecar")
+      const late = await Promise.race([
+        sidecar.platformSupport().then(
+          () => "settled",
+          () => "rejected",
+        ),
+        new Promise<"hung">((resolve) => {
+          setTimeout(() => resolve("hung"), 2_000).unref()
+        }),
+      ])
+      assert.equal(late, "rejected", "calls made after the sidecar is gone must reject, not hang")
+    } finally {
+      sidecar.stop()
+    }
+  })
 })
 
 describe("sidecar platform support probing", () => {

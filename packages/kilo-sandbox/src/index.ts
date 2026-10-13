@@ -1,4 +1,5 @@
 export type { Profile } from "./profile"
+export type { CidrPortRule, CidrPortSelector } from "@kilocode/mxc-sidecar"
 export { assertWrite, enabled, run, unrestricted } from "./context"
 export { decorateFileSystem, ensureDirectory } from "./filesystem"
 export { assertNetwork, assertSandbox, decorateHttpClient, httpLayer as networkHttpLayer } from "./network"
@@ -22,4 +23,11 @@ export {
   type ProbeOptions,
 } from "./probe"
 export { isPublicAddress, normalizeDestinations, parseDestination } from "./destination"
+export {
+  normalizeCidrRules,
+  resolveEgressPosture,
+  STARTER_EGRESS_ALLOWLIST,
+  type EgressPosture,
+  type EgressPostureInput,
+} from "./egress"
 export { CurrentProxyFactory, startProxy, type ProxyFactory, type ProxyResolver } from "./proxy"

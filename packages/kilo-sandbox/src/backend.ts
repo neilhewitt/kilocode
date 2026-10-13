@@ -1,12 +1,12 @@
 import { Effect, PlatformError, Scope } from "effect"
 import { ChildProcess } from "effect/unstable/process"
-import { bubblewrap } from "./bubblewrap"
-import { current } from "./context"
-import { mxc } from "./mxc"
-import { assertProcessNetwork, networkEnvironment } from "./network"
+import { bubblewrap } from "./bubblewrap.ts"
+import { current } from "./context.ts"
+import { mxc } from "./mxc.ts"
+import { assertProcessNetwork, networkEnvironment } from "./network.ts"
 import type { Profile } from "./profile"
-import { seatbelt } from "./seatbelt"
-import { currentProxy, type ProxyRuntime } from "./proxy"
+import { seatbelt } from "./seatbelt.ts"
+import { currentProxy, type ProxyRuntime } from "./proxy.ts"
 
 export interface Launch {
   readonly command: string

@@ -56,6 +56,9 @@ function limits(fallback: ReturnType<typeof SandboxConfig.resolve>) {
       value.startsWith("~") ? path.join(os.homedir(), value.slice(1)) : value,
     ),
     audit: fallback.audit,
+    ...(fallback.allowedCidrs !== undefined && fallback.allowedCidrs.length > 0
+      ? { allowedCidrs: fallback.allowedCidrs }
+      : {}),
   }
 }
 
@@ -63,12 +66,17 @@ function apply(current: Snapshot, fallback: ReturnType<typeof SandboxConfig.reso
   return { ...current, ...limits(fallback) }
 }
 
+function cidrsEqual(left: ReadonlyArray<Snapshot["allowedCidrs"]>[number] | undefined, right: ReadonlyArray<Snapshot["allowedCidrs"]>[number] | undefined) {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? [])
+}
+
 function matches(current: Snapshot, next: Snapshot) {
   return (
     current.mode === next.mode &&
     current.allowedHosts.join("\0") === next.allowedHosts.join("\0") &&
     current.writablePaths.join("\0") === next.writablePaths.join("\0") &&
-    current.audit === next.audit
+    current.audit === next.audit &&
+    cidrsEqual(current.allowedCidrs, next.allowedCidrs)
   )
 }
 
@@ -280,6 +288,7 @@ export function profile(
   extraWritable?: readonly string[],
   allowedHosts: readonly string[] = [],
   relaxations?: readonly Relaxation[],
+  allowedCidrs: NonNullable<Profile["network"]["allowedCidrs"]> = [],
 ): Profile {
   const project = isolated(ctx)
     ? [ctx.directory]
@@ -308,6 +317,7 @@ export function profile(
     network: {
       mode,
       allowedHosts,
+      ...(allowedCidrs.length > 0 ? { allowedCidrs } : {}),
     },
     environment: {
       deny: [
@@ -566,7 +576,20 @@ export const resolveGate = Effect.fn("SandboxPolicy.resolveGate")(function* (ses
         tier: gate.tier,
         reason: refusal,
         diagnostics: [...gate.diagnostics],
-        ...(continued ? { denied: deniedByProfile(profile(ctx, base.mode, base.writablePaths, base.allowedHosts)) } : {}),
+        ...(continued
+          ? {
+              denied: deniedByProfile(
+                profile(
+                  ctx,
+                  base.mode,
+                  base.writablePaths,
+                  base.allowedHosts,
+                  base.relaxations ?? [],
+                  base.allowedCidrs ?? [],
+                ),
+              ),
+            }
+          : {}),
       }
       yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, audit))
       return value
@@ -624,11 +647,16 @@ export const relax = Effect.fn("SandboxPolicy.relax")(function* (sessionID: Sess
 
 function intersect(parent: Snapshot, child: Snapshot) {
   const paths = child.writablePaths.filter((value) => parent.writablePaths.includes(value))
+  const parentCidrs = parent.allowedCidrs ?? []
+  const cidrs =
+    parentCidrs.length > 0
+      ? (child.allowedCidrs ?? []).filter((rule) => parentCidrs.some((entry) => JSON.stringify(entry) === JSON.stringify(rule)))
+      : []
   if (parent.mode === "deny" || child.mode === "deny") {
-    return { mode: "deny" as const, allowedHosts: [], writablePaths: paths }
+    return { mode: "deny" as const, allowedHosts: [], writablePaths: paths, ...(cidrs.length > 0 ? { allowedCidrs: cidrs } : {}) }
   }
   if (parent.mode === "allow" && child.mode === "allow") {
-    return { mode: "allow" as const, allowedHosts: [], writablePaths: paths }
+    return { mode: "allow" as const, allowedHosts: [], writablePaths: paths, ...(cidrs.length > 0 ? { allowedCidrs: cidrs } : {}) }
   }
   const hosts =
     parent.mode === "proxy" && child.mode === "proxy"
@@ -640,6 +668,7 @@ function intersect(parent: Snapshot, child: Snapshot) {
     mode: hosts.length > 0 ? ("proxy" as const) : ("deny" as const),
     allowedHosts: hosts,
     writablePaths: paths,
+    ...(cidrs.length > 0 ? { allowedCidrs: cidrs } : {}),
   }
 }
 
@@ -662,7 +691,8 @@ const inheritSnapshot = Effect.fn("SandboxPolicy.inheritSnapshot")(function* (
     child.enabled === next.enabled &&
     child.mode === next.mode &&
     child.allowedHosts.join("\0") === next.allowedHosts.join("\0") &&
-    child.writablePaths.join("\0") === next.writablePaths.join("\0")
+    child.writablePaths.join("\0") === next.writablePaths.join("\0") &&
+    cidrsEqual(child.allowedCidrs, next.allowedCidrs)
   )
     return
   yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
@@ -775,7 +805,14 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
           // this SDK generation it crashes the host process (documented
           // upstream blocker), so the default is the unsandboxed dry run.
           const ctx = yield* InstanceState.context
-          const composed = profile(ctx, active.state.mode, active.state.writablePaths, active.state.allowedHosts, relaxations)
+          const composed = profile(
+            ctx,
+            active.state.mode,
+            active.state.writablePaths,
+            active.state.allowedHosts,
+            relaxations,
+            active.state.allowedCidrs ?? [],
+          )
           const table = translate(composed, { command: "", args: [], cwd: ctx.directory, environment: process.env })
           yield* Effect.promise(() =>
             SandboxStore.appendAudit(sessionID, {
@@ -787,7 +824,7 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
                 readwrite: table.filesystem.readwritePaths,
                 readonly: table.filesystem.readonlyPaths,
                 denied: table.filesystem.deniedPaths,
-                egress: table.network.egress.default,
+                egress: table.network.egress,
               },
               relaxations,
             }),
@@ -822,6 +859,7 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
             active.state.writablePaths,
             active.state.allowedHosts,
             relaxations,
+            active.state.allowedCidrs ?? [],
           ),
           effect,
         )

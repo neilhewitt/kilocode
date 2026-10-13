@@ -21,8 +21,8 @@ export function createRuntime() {
         source: "scripted",
       }
     },
-    run: async (command) => {
-      event({ type: "run", command })
+    run: async (command, bindings) => {
+      event({ type: "run", command, bindings: bindings ?? {} })
       const canned = JSON.parse(process.env.KILO_MXC_SCRIPT_RESULT ?? "{}")
       const result = {
         exitCode: canned.exitCode ?? 0,

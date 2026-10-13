@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import { realpathSync } from "node:fs"
 import path from "node:path"
 import { Global } from "@opencode-ai/core/global"
-import { isRelaxation, type Profile, type Relaxation } from "@kilocode/sandbox"
+import { isRelaxation, type CidrPortRule, type Profile, type Relaxation } from "@kilocode/sandbox"
 import type { SessionID } from "@/session/schema"
 
 export namespace SandboxStore {
@@ -13,6 +13,8 @@ export namespace SandboxStore {
     mode: Profile["network"]["mode"]
     allowedHosts: string[]
     writablePaths: string[]
+    // Recorded raw CIDR/port egress relaxations; absent when none are configured.
+    allowedCidrs?: ReadonlyArray<CidrPortRule>
     version: number
     /** Set when a host-gate refusal was resolved as continue-unsandboxed: confinement is off by explicit choice. */
     unsandboxed?: boolean
@@ -82,6 +84,7 @@ export namespace SandboxStore {
       mode: state.mode as Snapshot["mode"],
       allowedHosts: (state.allowedHosts as string[] | undefined) ?? [],
       writablePaths: (state.writablePaths as string[] | undefined) ?? [],
+      ...(Array.isArray(state.allowedCidrs) ? { allowedCidrs: state.allowedCidrs as ReadonlyArray<CidrPortRule> } : {}),
       version: state.version as number,
       ...(state.unsandboxed === undefined ? {} : { unsandboxed: state.unsandboxed as boolean }),
       ...(state.audit === undefined ? {} : { audit: state.audit as boolean }),

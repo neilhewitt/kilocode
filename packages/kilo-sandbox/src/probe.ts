@@ -1,7 +1,7 @@
 import os from "node:os"
 import { startSidecar } from "@kilocode/mxc-sidecar"
-import { mxcRuntime } from "./mxc"
-import type { Profile } from "./profile"
+import { mxcRuntime } from "./mxc.ts"
+import type { Profile } from "./profile.ts"
 
 // Host gating (ticket 14, ADR 0001/0005): a read-only session-start capability
 // probe decides whether sandbox mode may run. Only the base-container (PSEC)
