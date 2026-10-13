@@ -17,12 +17,18 @@ export const SandboxStatus = Schema.Struct({
   enabled: Schema.Boolean,
   available: Schema.Boolean,
   reason: Schema.optional(Schema.String),
+  diagnostics: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
+  unsandboxed: Schema.optional(Schema.Boolean),
   version: Schema.Int,
 })
 
 export const SandboxSupport = Schema.Struct({
   available: Schema.Boolean,
   reason: Schema.optional(Schema.String),
+})
+
+export const SandboxGatePayload = Schema.Struct({
+  choice: Schema.Literals(["abort", "continue-unsandboxed"]),
 })
 
 export const SandboxApi = HttpApi.make("sandbox")
@@ -61,6 +67,20 @@ export const SandboxApi = HttpApi.make("sandbox")
             identifier: "sandbox.toggle",
             summary: "Toggle session sandbox",
             description: "Toggle and persist the sandbox state for one session.",
+          }),
+        ),
+        HttpApiEndpoint.post("gate", `${root}/gate`, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SandboxGatePayload,
+          success: described(SandboxStatus, "Resolved session sandbox gate status"),
+          error: ApiNotFoundError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "sandbox.gate",
+            summary: "Resolve the sandbox host gate",
+            description:
+              "Resolve a host-gate refusal for one session: abort, or continue unsandboxed with unmistakable signalling and an audit record of what would have been denied.",
           }),
         ),
       )

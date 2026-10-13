@@ -14,6 +14,12 @@ describe("sandbox TUI", () => {
     ).toBeUndefined()
   })
 
+  test("signals a continued-unsandboxed session unmistakably", () => {
+    expect(
+      indicator({ directory: "/repo", enabled: false, available: false, reason: "RUNNING UNSANDBOXED: refused", unsandboxed: true, version: 3 }),
+    ).toBe("△ UNSANDBOXED")
+  })
+
   test("keeps the prompt status contribution mounted while inactive", () => {
     const content = fs.readFileSync(source, "utf8")
     expect(content).toContain("<box flexShrink={0}>")
