@@ -1,4 +1,4 @@
-import { parseDestination } from "./destination"
+import { parseDestination } from "./destination.ts"
 
 const MAX_RECORD = 16 * 1024
 const MAX_HELLO = 64 * 1024 - 1
@@ -107,8 +107,11 @@ export class TlsClientHello {
   private total = 0
   private state: State = "pending"
   private validated = false
+  private readonly expected: string
 
-  constructor(private readonly expected: string) {}
+  constructor(expected: string) {
+    this.expected = expected
+  }
 
   push(input: Buffer): State {
     if (this.state === "invalid" || input.length === 0) return this.state

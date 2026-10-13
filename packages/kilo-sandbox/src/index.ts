@@ -1,9 +1,37 @@
 export type { Profile } from "./profile"
+export type { CidrPortRule, CidrPortSelector } from "@kilocode/mxc-sidecar"
 export { assertWrite, enabled, run, unrestricted } from "./context"
 export { decorateFileSystem, ensureDirectory } from "./filesystem"
 export { assertNetwork, assertSandbox, decorateHttpClient, httpLayer as networkHttpLayer } from "./network"
 export { batchMutations, mutate, withRunner, type Runner as MutationRunner } from "./mutation"
 export type { Request as MutationRequest } from "./mutation-protocol"
 export { backendSupport, prepareCommand } from "./backend"
+export { mxcRuntime, translate } from "./mxc"
+export type { AuditPosture, PathRelaxation, Relaxation, RelaxationAccess } from "./profile"
+export { isRelaxation, merged, pathRelaxations } from "./relaxation"
+export {
+  ENFORCEMENT_FLOOR_DOC,
+  ENFORCEMENT_FLOOR_TIER,
+  OFF_PLATFORM_ASSESSMENT,
+  assessPlatformSupport,
+  deniedByProfile,
+  probeMxcSupport,
+  type GateAssessment,
+  type GateDenials,
+  type GateSource,
+  type GateVerdict,
+  type ProbeOptions,
+} from "./probe"
 export { isPublicAddress, normalizeDestinations, parseDestination } from "./destination"
+export {
+  normalizeCidrRules,
+  resolveEgressPosture,
+  STARTER_EGRESS_ALLOWLIST,
+  type EgressPosture,
+  type EgressPostureInput,
+} from "./egress"
 export { CurrentProxyFactory, startProxy, type ProxyFactory, type ProxyResolver } from "./proxy"
+// Terminal handling (ADR 0004): the pipes fallback decision surface.
+export type { PipesTty, TerminalDecision } from "./terminal"
+export { PIPES_FALLBACK_SIGNAL, PTY_REVISIT_TRIGGER, pipesTty, terminalDecision } from "./terminal"
+export { confine } from "./backend"

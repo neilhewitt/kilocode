@@ -5,6 +5,7 @@ import { join, relative, dirname, basename } from "node:path"
 import { chmodSync, statSync, rmSync, readdirSync, existsSync } from "node:fs"
 import {
   copyKiloSandboxWorker,
+  copyMxcSidecarUnit,
   copySandboxResources,
   copyTreeSitterResources,
   hasKiloSandboxWorker,
@@ -365,6 +366,7 @@ async function main() {
   await copyTreeSitterResources(sourceBinPath, targetBinPath)
   await copySandboxResources(sourceBinPath, targetBinPath)
   await copyKiloSandboxWorker(sourceBinPath, targetBinPath)
+  await copyMxcSidecarUnit(sourceBinPath, targetBinPath)
   chmodSync(targetBinPath, 0o755)
   await ensureLocalHelpers()
 

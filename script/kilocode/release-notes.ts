@@ -1,4 +1,8 @@
 import { $ } from "bun"
+// kilocode_change - the sidecar unit's pins belong in release notes (ADR 0005)
+import { expectedManifest } from "../../packages/kilo-mxc-sidecar/src/unit/manifest"
+import { sidecarReleaseNotes } from "../../packages/kilo-mxc-sidecar/src/unit/notes"
+import { PROTOCOL_VERSION } from "../../packages/kilo-mxc-sidecar/src/protocol"
 
 const fallback = "No notable changes"
 const pattern = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/
@@ -60,6 +64,21 @@ export function buildReleaseNotes(input: {
   return notes.join("\n\n") || fallback
 }
 
+// kilocode_change start - append the sidecar unit pins to every release's
+// notes (spec: release notes include the SDK pin and contract changes). The
+// section is generated from the manifest the unit build produces; when a
+// previous release's manifest is available, pass it to get pin-change diffs.
+// The MXC sidecar unit ships for Windows only (ADR 0005); the notes text
+// itself carries node/SDK/protocol pins, not the platform.
+export function sidecarSection(version: string, previous?: ReturnType<typeof expectedManifest>) {
+  const current = expectedManifest(
+    { os: "win32", arch: "x64" },
+    { version, protocol: PROTOCOL_VERSION, entry: "sidecar/src/main.ts" },
+  )
+  return sidecarReleaseNotes({ current, previous })
+}
+// kilocode_change end
+
 export async function publishNotes(input: { version: string; prerelease: boolean; repo?: string; temp?: string }) {
   const repo = input.repo ? ["--repo", input.repo] : []
   const releases: Release[] = await $`gh release list --limit 1000 --json tagName,isDraft,isPrerelease ${repo}`.json()
@@ -70,10 +89,12 @@ export async function publishNotes(input: { version: string; prerelease: boolean
     Bun.file(new URL("../../packages/opencode/CHANGELOG.md", import.meta.url)).text(),
   ])
   const body = buildReleaseNotes({ ...input, releases, vscode, cli })
+  // kilocode_change - the sidecar unit section travels with every release
+  const withSidecar = `${body}\n\n${sidecarSection(version(input.version))}`
   const notes = `${input.temp ?? "/tmp"}/release-notes.txt`
   const target = input.version.startsWith("v") ? input.version : `v${input.version}`
   const flags = input.prerelease ? ["--draft=false", "--prerelease"] : ["--draft=false"]
-  await Bun.write(notes, body)
+  await Bun.write(notes, withSidecar)
   flags.push("--title", `${target} (${input.prerelease ? "pre-release" : "release"})`, "--notes-file", notes)
   await $`gh release edit ${target} ${flags} ${repo}`
 }

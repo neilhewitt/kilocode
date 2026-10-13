@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import { realpathSync } from "node:fs"
 import path from "node:path"
 import { Global } from "@opencode-ai/core/global"
-import type { Profile } from "@kilocode/sandbox"
+import { isRelaxation, type CidrPortRule, type Profile, type Relaxation } from "@kilocode/sandbox"
 import type { SessionID } from "@/session/schema"
 
 export namespace SandboxStore {
@@ -13,7 +13,19 @@ export namespace SandboxStore {
     mode: Profile["network"]["mode"]
     allowedHosts: string[]
     writablePaths: string[]
+    // Recorded raw CIDR/port egress relaxations; absent when none are configured.
+    allowedCidrs?: ReadonlyArray<CidrPortRule>
     version: number
+    /** Set when a host-gate refusal was resolved as continue-unsandboxed: confinement is off by explicit choice. */
+    unsandboxed?: boolean
+    /**
+     * The session's prompt-granted relaxations (ADR 0002). Ephemeral by design: stored with the
+     * session snapshot so they live exactly as long as the session and never seed the next one.
+     * Durable relaxations are never stored — config re-composes them each session.
+     */
+    relaxations?: Relaxation[]
+    /** Audit mode: commands run unsandboxed while the grant table they would have had is recorded per command. */
+    audit?: boolean
   }
 
   export const root = path.join(realpathSync.native(path.dirname(Global.Path.state)), "kilo-sandbox-policy")
@@ -30,6 +42,11 @@ export namespace SandboxStore {
     return path.join(dir(sessionID), hash(directory) + ".json")
   }
 
+  /** Destination for the MXC engine's denial report when the audit engine path is enabled for a session. */
+  export function denialsPath(sessionID: SessionID) {
+    return path.join(dir(sessionID), "engine-denials.json")
+  }
+
   function valid(value: unknown) {
     if (!value || typeof value !== "object") return false
     const state = value as Record<string, unknown>
@@ -41,6 +58,10 @@ export namespace SandboxStore {
     if (!base) return false
     if (state.allowedHosts !== undefined && !Array.isArray(state.allowedHosts)) return false
     if (state.writablePaths !== undefined && !Array.isArray(state.writablePaths)) return false
+    if (state.unsandboxed !== undefined && typeof state.unsandboxed !== "boolean") return false
+    if (state.audit !== undefined && typeof state.audit !== "boolean") return false
+    if (state.relaxations !== undefined && !Array.isArray(state.relaxations)) return false
+    if (Array.isArray(state.relaxations) && !state.relaxations.every((entry) => isRelaxation(entry))) return false
     if (Array.isArray(state.allowedHosts) && state.allowedHosts.some((value) => typeof value !== "string")) return false
     if (Array.isArray(state.writablePaths) && state.writablePaths.some((value) => typeof value !== "string"))
       return false
@@ -63,7 +84,11 @@ export namespace SandboxStore {
       mode: state.mode as Snapshot["mode"],
       allowedHosts: (state.allowedHosts as string[] | undefined) ?? [],
       writablePaths: (state.writablePaths as string[] | undefined) ?? [],
+      ...(Array.isArray(state.allowedCidrs) ? { allowedCidrs: state.allowedCidrs as ReadonlyArray<CidrPortRule> } : {}),
       version: state.version as number,
+      ...(state.unsandboxed === undefined ? {} : { unsandboxed: state.unsandboxed as boolean }),
+      ...(state.audit === undefined ? {} : { audit: state.audit as boolean }),
+      ...(state.relaxations === undefined ? {} : { relaxations: state.relaxations as Relaxation[] }),
     } satisfies Snapshot
   }
 
@@ -89,5 +114,13 @@ export namespace SandboxStore {
 
   export async function dispose(sessionID: SessionID) {
     await fs.rm(dir(sessionID), { recursive: true, force: true })
+  }
+
+  /** Appends one sandbox gate audit record for a session as a JSON line. */
+  export async function appendAudit(sessionID: SessionID, entry: Record<string, unknown>) {
+    const folder = dir(sessionID)
+    await fs.mkdir(folder, { recursive: true, mode: 0o700 })
+    const line = JSON.stringify({ time: new Date().toISOString(), ...entry }) + "\n"
+    await fs.appendFile(path.join(folder, "audit.jsonl"), line, "utf8")
   }
 }

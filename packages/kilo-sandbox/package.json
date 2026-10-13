@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "catalog:",
+    "@kilocode/mxc-sidecar": "workspace:*",
     "effect": "catalog:",
     "ipaddr.js": "catalog:"
   },

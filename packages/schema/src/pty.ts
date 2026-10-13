@@ -30,6 +30,11 @@ export const Info = Schema.Struct({
   pid: NonNegativeInt,
   exitCode: optional(NonNegativeInt),
   sessionID: optional(Schema.NullOr(SessionID)), // kilocode_change - Kilo associates PTYs with sessions
+  // kilocode_change start - ticket 17: present on every Info; "pipes" marks a
+  // pipes-fallback terminal (confinement active: no TTY, input and resize
+  // unavailable); absent means the real ConPTY terminal as before.
+  tty: optional(Schema.Literals(["pty", "pipes"])),
+  // kilocode_change end
 }).annotate({ identifier: "Pty" })
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 
@@ -53,6 +58,10 @@ export const CreateInput = Schema.Struct({
     }),
   ),
   // kilocode_change end
+  // kilocode_change start - ticket 17: terminals are created in the context of
+  // a session so the sandbox gate can consult that session's confinement state.
+  sessionID: optional(Schema.NullOr(SessionID)),
+  // kilocode_change end
 })
 export interface CreateInput extends Schema.Schema.Type<typeof CreateInput> {}
 
@@ -64,5 +73,6 @@ export const UpdateInput = Schema.Struct({
       cols: PositiveInt,
     }),
   ),
+  sessionID: optional(Schema.NullOr(SessionID)), // kilocode_change
 })
 export interface UpdateInput extends Schema.Schema.Type<typeof UpdateInput> {}

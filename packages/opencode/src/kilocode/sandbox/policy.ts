@@ -4,7 +4,16 @@ import path from "node:path"
 import { Effect, Semaphore } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import { Database } from "@opencode-ai/core/database/database"
-import { backendSupport, run as runSandbox, unrestricted, type Profile } from "@kilocode/sandbox"
+import {
+  backendSupport,
+  deniedByProfile,
+  isRelaxation,
+  run as runSandbox,
+  translate,
+  unrestricted,
+  type Profile,
+  type Relaxation,
+} from "@kilocode/sandbox"
 import { Bus } from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import { Instance } from "@/kilocode/instance"
@@ -13,7 +22,9 @@ import { InstanceState } from "@/effect/instance-state"
 import type { InstanceContext } from "@/project/instance-context"
 import type { SessionID } from "@/session/schema"
 import { Changed } from "./event"
+import * as SandboxGate from "./gate"
 import * as Network from "./network"
+import * as SandboxRelaxation from "./relaxation"
 import { SandboxPreference } from "./preference"
 import * as SandboxState from "./state"
 import { SandboxConfig } from "./config"
@@ -28,11 +39,16 @@ const locks = new Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number 
 const refreshes = new Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number }>()
 const gates = new Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number }>()
 const permits = 1_000_000
-let revision = 0
-
-GlobalBus.on("event", (event) => {
-  if (event.payload?.type === "global.config.updated" && event.payload.properties?.sandbox === true) revision++
-})
+// The config-change counter, scoped to its only mutation: the global-config
+// subscription bumps it, readers sample it to detect staleness, and nothing
+// else can touch it because the mutable binding lives inside the closure.
+const revision = (() => {
+  let value = 0
+  GlobalBus.on("event", (event) => {
+    if (event.payload?.type === "global.config.updated" && event.payload.properties?.sandbox === true) value++
+  })
+  return () => value
+})()
 
 function key(directory: string, sessionID: SessionID) {
   return directory + "\0" + sessionID
@@ -45,6 +61,10 @@ function limits(fallback: ReturnType<typeof SandboxConfig.resolve>) {
     writablePaths: fallback.writablePaths.map((value) =>
       value.startsWith("~") ? path.join(os.homedir(), value.slice(1)) : value,
     ),
+    audit: fallback.audit,
+    ...(fallback.allowedCidrs !== undefined && fallback.allowedCidrs.length > 0
+      ? { allowedCidrs: fallback.allowedCidrs }
+      : {}),
   }
 }
 
@@ -52,16 +72,24 @@ function apply(current: Snapshot, fallback: ReturnType<typeof SandboxConfig.reso
   return { ...current, ...limits(fallback) }
 }
 
+function cidrsEqual(left: ReadonlyArray<Snapshot["allowedCidrs"]>[number] | undefined, right: ReadonlyArray<Snapshot["allowedCidrs"]>[number] | undefined) {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? [])
+}
+
 function matches(current: Snapshot, next: Snapshot) {
   return (
     current.mode === next.mode &&
     current.allowedHosts.join("\0") === next.allowedHosts.join("\0") &&
-    current.writablePaths.join("\0") === next.writablePaths.join("\0")
+    current.writablePaths.join("\0") === next.writablePaths.join("\0") &&
+    current.audit === next.audit &&
+    cidrsEqual(current.allowedCidrs, next.allowedCidrs)
   )
 }
 
-function changed(sessionID: SessionID, directory: string, next: Snapshot) {
+const publishChanged = Effect.fn("SandboxPolicy.publishChanged")(function* (sessionID: SessionID, directory: string, next: Snapshot) {
+  const gate = yield* SandboxGate.assess()
   const support = backendSupport({ mode: next.mode, allowedHosts: next.allowedHosts })
+  const merged = SandboxGate.fold(support, gate)
   GlobalBus.emit("event", {
     directory,
     payload: {
@@ -70,14 +98,17 @@ function changed(sessionID: SessionID, directory: string, next: Snapshot) {
       properties: {
         sessionID,
         directory,
-        enabled: next.enabled && support.available,
-        available: support.available,
-        reason: support.reason,
+        enabled: next.enabled && merged.available,
+        available: merged.available,
+        reason: merged.reason,
+        diagnostics: [...merged.diagnostics],
+        unsandboxed: next.unsandboxed === true,
+        audit: next.audit === true,
         version: next.version,
       },
     },
   })
-}
+})
 
 function initial(
   chosen: boolean | undefined,
@@ -101,59 +132,75 @@ const resolveInitial = Effect.fn("SandboxPolicy.resolveInitial")(function* (dire
   const fallback = SandboxConfig.resolve(cfg)
   return initial(chosen?.enabled, pref, fallback.enabled, fallback)
 })
-function locked<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const entry = locks.get(sessionID) ?? { semaphore: Semaphore.makeUnsafe(1), refs: 0 }
-      entry.refs++
-      locks.set(sessionID, entry)
-      return entry
-    }),
-    (entry) => entry.semaphore.withPermits(1)(effect),
-    (entry) =>
-      Effect.sync(() => {
-        entry.refs--
-        if (entry.refs === 0 && locks.get(sessionID) === entry) locks.delete(sessionID)
-      }),
-  )
+
+// The one command's relaxations: durable config entries first, then the
+// session's prompt-granted ones (ADR 0002). Durable relaxations are never
+// persisted — each command re-composes them from config, so removing one
+// restores the default table on the next session.
+function relaxationsFor(state: Snapshot, config: ReturnType<typeof SandboxConfig.resolve>) {
+  return SandboxRelaxation.effective(config.relaxations, state.relaxations)
 }
+
+// Durable config relaxations take effect with the session: each grant is
+// recorded once per session in the session log with its source (config).
+const logConfigRelaxations = Effect.fn("SandboxPolicy.logConfigRelaxations")(function* (
+  sessionID: SessionID,
+  state: Snapshot,
+) {
+  if (!state.enabled && state.audit !== true) return
+  if (!SandboxRelaxation.once(`config\0${sessionID}`)) return
+  const cfg = yield* (yield* Config.Service).get()
+  for (const entry of SandboxConfig.resolve(cfg).relaxations) {
+    yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, SandboxRelaxation.record(entry, "config")))
+  }
+})
+
+// Audit mode's engine path — MXC captureDenials allow-mode — is wired end to
+// end but crashes the SDK host process (0xC0000005) in MXC SDK 1.0.0 on a
+// live base-container host (verified in an isolated child; the byte-identical
+// request without captureDenials enforces cleanly). Until upstream fixes it,
+// audit sessions run on the unsandboxed dry-run path; a host with a fixed
+// engine opts in with KILO_MXC_AUDIT_ENGINE=1.
+function engineAudit() {
+  return process.env.KILO_MXC_AUDIT_ENGINE === "1"
+}
+
+// The ref-counted semaphore pools: one semaphore per session, its entry kept
+// alive while any holder remains. Three independent pools, one shape — each
+// differs only in which map it pools and what it builds. The single-permit
+// pools (a run's lock, a refresh) hold a fixed acquire count of 1; the gate
+// pool takes its permit count per call, same count it built the semaphore
+// with.
+type Pool = Map<SessionID, { semaphore: Semaphore.Semaphore; refs: number }>
+function pooled(entries: Pool, build: () => Semaphore.Semaphore) {
+  return <A, E, R>(sessionID: SessionID, count: number, effect: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const entry = entries.get(sessionID) ?? { semaphore: build(), refs: 0 }
+        entry.refs++
+        entries.set(sessionID, entry)
+        return entry
+      }),
+      (entry) => entry.semaphore.withPermits(count)(effect),
+      (entry) =>
+        Effect.sync(() => {
+          entry.refs--
+          if (entry.refs === 0 && entries.get(sessionID) === entry) entries.delete(sessionID)
+        }),
+    )
+}
+
+function pooledPermit1(entries: Pool, build: () => Semaphore.Semaphore) {
+  const multi = pooled(entries, build)
+  return <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) => multi(sessionID, 1, effect)
+}
+
+const locked = pooledPermit1(locks, () => Semaphore.makeUnsafe(1))
+const refreshing = pooledPermit1(refreshes, () => Semaphore.makeUnsafe(1))
+const gated = pooled(gates, () => Semaphore.makeUnsafe(permits))
 
 function lockedAll<A, E, R>(sessions: readonly SessionID[], effect: Effect.Effect<A, E, R>) {
   return [...new Set(sessions)].reduceRight((next, sessionID) => locked(sessionID, next), effect)
-}
-
-function refreshing<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const entry = refreshes.get(sessionID) ?? { semaphore: Semaphore.makeUnsafe(1), refs: 0 }
-      entry.refs++
-      refreshes.set(sessionID, entry)
-      return entry
-    }),
-    (entry) => entry.semaphore.withPermits(1)(effect),
-    (entry) =>
-      Effect.sync(() => {
-        entry.refs--
-        if (entry.refs === 0 && refreshes.get(sessionID) === entry) refreshes.delete(sessionID)
-      }),
-  )
-}
-
-function gated<A, E, R>(sessionID: SessionID, count: number, effect: Effect.Effect<A, E, R>) {
-  return Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const entry = gates.get(sessionID) ?? { semaphore: Semaphore.makeUnsafe(permits), refs: 0 }
-      entry.refs++
-      gates.set(sessionID, entry)
-      return entry
-    }),
-    (entry) => entry.semaphore.withPermits(count)(effect),
-    (entry) =>
-      Effect.sync(() => {
-        entry.refs--
-        if (entry.refs === 0 && gates.get(sessionID) === entry) gates.delete(sessionID)
-      }),
-  )
 }
 
 function gatedAll<A, E, R>(sessions: readonly SessionID[], effect: Effect.Effect<A, E, R>) {
@@ -230,6 +277,8 @@ export function profile(
   mode: Profile["network"]["mode"] = "deny",
   extraWritable?: readonly string[],
   allowedHosts: readonly string[] = [],
+  relaxations?: readonly Relaxation[],
+  allowedCidrs: NonNullable<Profile["network"]["allowedCidrs"]> = [],
 ): Profile {
   const project = isolated(ctx)
     ? [ctx.directory]
@@ -258,6 +307,7 @@ export function profile(
     network: {
       mode,
       allowedHosts,
+      ...(allowedCidrs.length > 0 ? { allowedCidrs } : {}),
     },
     environment: {
       deny: [
@@ -275,6 +325,7 @@ export function profile(
         TEMP: Global.Path.tmp,
       },
     },
+    ...(relaxations === undefined || relaxations.length === 0 ? {} : { relaxations }),
   }
 }
 
@@ -301,12 +352,13 @@ const snapshot = Effect.fn("SandboxPolicy.snapshot")(function* (sessionID: Sessi
       // session moved or created with an explicit choice keeps that choice instead of resetting. The
       // persisted per-directory preference (last toggled state) is the next precedence, so new sessions
       // inherit the last /sandbox choice. The config default applies when neither is present.
-      const version = revision
+      const version = revision()
       const next = yield* resolveInitial(directory, sessionID)
       yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
       const id = key(directory, sessionID)
       snapshots.set(id, next)
       synced.set(id, version)
+      yield* logConfigRelaxations(sessionID, next)
       return { directory, state: next }
     }),
   )
@@ -317,11 +369,11 @@ function current(
   inside = false,
 ): Effect.Effect<{ directory: string; state: Snapshot }, never, Config.Service | Database.Service> {
   return Effect.gen(function* () {
-    const expected = revision
+    const expected = revision()
     const state = yield* snapshot(sessionID)
     const id = key(state.directory, sessionID)
     if (synced.get(id) !== expected) yield* inside ? reconcile(sessionID, expected) : refresh(sessionID, expected)
-    if (revision !== expected) return yield* current(sessionID, inside)
+    if (revision() !== expected) return yield* current(sessionID, inside)
     return yield* snapshot(sessionID)
   })
 }
@@ -338,12 +390,22 @@ export function fallback(config: Config.Info) {
 
 export const status = Effect.fn("SandboxPolicy.status")(function* (sessionID: SessionID) {
   const active = yield* current(sessionID)
+  const gate = yield* SandboxGate.assess()
   const support = backendSupport({ mode: active.state.mode, allowedHosts: active.state.allowedHosts })
+  const merged = SandboxGate.fold(support, gate)
+  const unsandboxed = active.state.unsandboxed === true
+  const audit = active.state.audit === true
   return {
     directory: active.directory,
-    enabled: active.state.enabled && support.available,
-    available: support.available,
-    reason: support.reason,
+    enabled: active.state.enabled && merged.available,
+    available: merged.available,
+    reason:
+      unsandboxed && !merged.available && merged.reason
+        ? `${SandboxGate.UNSANDBOXED_SIGNAL}: ${merged.reason}`
+        : merged.reason,
+    diagnostics: [...merged.diagnostics],
+    unsandboxed,
+    audit,
     version: active.state.version,
   }
 })
@@ -353,7 +415,7 @@ export const networkRestricted = Effect.fn("SandboxPolicy.networkRestricted")(fu
   return active.state.enabled && active.state.mode !== "allow"
 })
 
-const reconcile = Effect.fn("SandboxPolicy.reconcile")(function* (sessionID: SessionID, version = revision) {
+const reconcile = Effect.fn("SandboxPolicy.reconcile")(function* (sessionID: SessionID, version = revision()) {
   const directory = yield* InstanceState.directory
   return yield* refreshing(
     sessionID,
@@ -374,13 +436,13 @@ const reconcile = Effect.fn("SandboxPolicy.reconcile")(function* (sessionID: Ses
       yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
       snapshots.set(id, next)
       synced.set(id, version)
-      yield* Effect.sync(() => changed(sessionID, directory, next))
+      yield* publishChanged(sessionID, directory, next)
       return true
     }),
   )
 })
 
-export const refresh = Effect.fn("SandboxPolicy.refresh")((sessionID: SessionID, version = revision) =>
+export const refresh = Effect.fn("SandboxPolicy.refresh")((sessionID: SessionID, version = revision()) =>
   locked(sessionID, reconcile(sessionID, version)),
 )
 
@@ -400,14 +462,16 @@ function change<E, R, F = never, Q = never, P = never, S = never>(
         const stored = yield* read(directory, sessionID)
         const current = stored ?? (yield* resolveInitial(directory, sessionID))
         const enabling = !current.enabled
-        const version = revision
+        const version = revision()
         const base = enabling ? apply(current, SandboxConfig.resolve(yield* (yield* Config.Service).get())) : current
+        const gate = yield* SandboxGate.assess()
         const support = backendSupport({ mode: base.mode, allowedHosts: base.allowedHosts })
+        const merged = SandboxGate.fold(support, gate)
         const status = {
           directory,
-          enabled: current.enabled && support.available,
-          available: support.available,
-          reason: support.reason,
+          enabled: current.enabled && merged.available,
+          available: merged.available,
+          reason: merged.reason,
           version: current.version,
         }
         if (enabling && !status.available) return status
@@ -417,11 +481,15 @@ function change<E, R, F = never, Q = never, P = never, S = never>(
           sessionID,
           Effect.gen(function* () {
             yield* typeof guard === "function" ? guard(enabling, targets) : guard
-            const next: Snapshot = { ...base, enabled: enabling, version: status.version + 1 }
+            // A regular toggle clears any gate resolution: the unsandboxed marker
+            // is written only by resolveGate, never by ordinary state changes.
+            const { unsandboxed: _resolved, ...rest } = base
+            const next: Snapshot = { ...rest, enabled: enabling, version: status.version + 1 }
             yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
             const id = key(directory, sessionID)
             snapshots.set(id, next)
             synced.set(id, version)
+            if (enabling) yield* logConfigRelaxations(sessionID, next)
             if (enabling) {
               yield* Effect.forEach(
                 targets,
@@ -438,7 +506,7 @@ function change<E, R, F = never, Q = never, P = never, S = never>(
             yield* Effect.promise(() => SandboxPreference.write(directory, next.enabled)).pipe(
               Effect.catch(() => Effect.void),
             )
-            const value = { ...status, enabled: next.enabled && support.available, version: next.version }
+            const value = { ...status, enabled: next.enabled && merged.available, version: next.version }
             // Publish through the standalone Bus facade so HTTP handlers do not need Bus.Service.
             yield* Effect.promise(() => Bus.publish(Instance.current, Changed, { sessionID, ...value }))
             return value
@@ -462,18 +530,160 @@ function change<E, R, F = never, Q = never, P = never, S = never>(
 
 export const toggle = Effect.fn("SandboxPolicy.toggle")((sessionID: SessionID) => change(sessionID, Effect.void))
 
+export type GateChoice = "abort" | "continue-unsandboxed"
+
+// Resolves a host-gate refusal with the one explicit choice the gate offers.
+// Both paths leave confinement off — the difference is what they record:
+// abort keeps the refusal only, while continue-unsandboxed marks the session
+// unmistakably and audits exactly which denials are not in force.
+export const resolveGate = Effect.fn("SandboxPolicy.resolveGate")(function* (sessionID: SessionID, choice: GateChoice) {
+  const directory = yield* InstanceState.directory
+  const gate = yield* SandboxGate.assess()
+  return yield* locked(
+    sessionID,
+    Effect.gen(function* () {
+      const stored = yield* read(directory, sessionID)
+      const base = stored ?? (yield* resolveInitial(directory, sessionID))
+      const version = base.version + 1
+      const next: Snapshot = { ...base, enabled: false, version, ...(choice === "continue-unsandboxed" ? { unsandboxed: true } : {}) }
+      yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
+      const id = key(directory, sessionID)
+      snapshots.set(id, next)
+      synced.set(id, revision())
+      const refusal = gate.verdict === "refuse" ? gate.reason : undefined
+      const continued = choice === "continue-unsandboxed"
+      const reason = continued
+        ? `${SandboxGate.UNSANDBOXED_SIGNAL}: ${refusal ?? "the sandbox is unavailable on this host"} — commands run with full reach and every audited denial is not in force`
+        : refusal
+      const value = { directory, enabled: false, available: false, reason, diagnostics: [...gate.diagnostics], unsandboxed: continued, version }
+      yield* Effect.promise(() => Bus.publish(Instance.current, Changed, { sessionID, ...value }))
+      const ctx = yield* InstanceState.context
+      const audit = {
+        type: continued ? "sandbox.gate.continue-unsandboxed" : "sandbox.gate.abort",
+        sessionID,
+        directory,
+        osBuild: os.release(),
+        tier: gate.tier,
+        reason: refusal,
+        diagnostics: [...gate.diagnostics],
+        ...(continued
+          ? {
+              denied: deniedByProfile(
+                profile(
+                  ctx,
+                  base.mode,
+                  base.writablePaths,
+                  base.allowedHosts,
+                  base.relaxations ?? [],
+                  base.allowedCidrs ?? [],
+                ),
+              ),
+            }
+          : {}),
+      }
+      yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, audit))
+      return value
+    }),
+  )
+})
+
 /** Stored confinement for a session in an explicit directory, without seeding from config. */
 export const peek = Effect.fn("SandboxPolicy.peek")(function* (directory: string, sessionID: SessionID) {
   return yield* read(directory, sessionID)
 })
 
+// The relaxation grant seam (ticket 15): the permission prompt, config, and
+// the PTY surface (ticket 17) all end here. A granted relaxation is stored
+// with the session snapshot — it applies to this session only and never
+// seeds the next one — and is recorded in the session log with its source
+// (prompt). Durable config relaxations never pass through here: they are
+// re-composed from config each command and logged once per session at init.
+export const relax = Effect.fn("SandboxPolicy.relax")(function* (sessionID: SessionID, request: unknown) {
+  if (!SandboxRelaxation.grantable(request)) {
+    return yield* Effect.fail(new Error("Invalid sandbox relaxation request"))
+  }
+  const gate = yield* SandboxGate.assess()
+  const directory = yield* InstanceState.directory
+  return yield* locked(
+    sessionID,
+    Effect.gen(function* () {
+      const stored = yield* read(directory, sessionID)
+      const base = stored ?? (yield* resolveInitial(directory, sessionID))
+      const { entries, added } = SandboxRelaxation.appended(base.relaxations ?? [], request)
+      const next: Snapshot = added ? { ...base, relaxations: entries, version: base.version + 1 } : base
+      if (added) {
+        yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
+        const id = key(directory, sessionID)
+        snapshots.set(id, next)
+        synced.set(id, revision())
+        yield* Effect.promise(() => SandboxStore.appendAudit(sessionID, SandboxRelaxation.record(request, "prompt")))
+      }
+      const support = backendSupport({ mode: next.mode, allowedHosts: next.allowedHosts })
+      const merged = SandboxGate.fold(support, gate)
+      const value = {
+        directory,
+        enabled: next.enabled && merged.available,
+        available: merged.available,
+        reason: merged.reason,
+        unsandboxed: next.unsandboxed === true,
+        audit: next.audit === true,
+        version: next.version,
+      }
+      yield* Effect.promise(() => Bus.publish(Instance.current, Changed, { sessionID, ...value }))
+      return value
+    })
+  )
+})
+
+// Ticket 17 — the PTY surface's consumption of a prompt-granted terminal
+// relaxation (ADR 0004). The grant is stored with the session snapshot like
+// any prompt relaxation, but kind "terminal" blesses exactly one terminal
+// spawn: consuming removes every terminal entry from the snapshot and records
+// the use in the session log. Durable config entries never pass through here
+// (they are re-composed from config each time and removed from config when
+// the posture should end).
+export const consumeTerminalGrant = Effect.fn("SandboxPolicy.consumeTerminalGrant")(function* (
+  sessionID: SessionID,
+  directory: string,
+) {
+  return yield* locked(
+    sessionID,
+    Effect.gen(function* () {
+      const stored = yield* read(directory, sessionID)
+      if (!stored) return false
+      const relaxations = (stored.relaxations ?? []).filter((entry) => !isRelaxation(entry) || entry.kind !== "terminal")
+      if (relaxations.length === (stored.relaxations ?? []).length) return false
+      const next: Snapshot = { ...stored, relaxations, version: stored.version + 1 }
+      yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
+      const id = key(directory, sessionID)
+      snapshots.set(id, next)
+      synced.set(id, revision())
+      yield* Effect.promise(() =>
+        SandboxStore.appendAudit(sessionID, {
+          type: "sandbox.terminal.use",
+          sessionID,
+          directory,
+          kind: "terminal",
+          note: "the recorded PTY relaxation was consumed by one terminal spawn",
+        }),
+      )
+      return true
+    }),
+  )
+})
+
 function intersect(parent: Snapshot, child: Snapshot) {
   const paths = child.writablePaths.filter((value) => parent.writablePaths.includes(value))
+  const parentCidrs = parent.allowedCidrs ?? []
+  const cidrs =
+    parentCidrs.length > 0
+      ? (child.allowedCidrs ?? []).filter((rule) => parentCidrs.some((entry) => JSON.stringify(entry) === JSON.stringify(rule)))
+      : []
   if (parent.mode === "deny" || child.mode === "deny") {
-    return { mode: "deny" as const, allowedHosts: [], writablePaths: paths }
+    return { mode: "deny" as const, allowedHosts: [], writablePaths: paths, ...(cidrs.length > 0 ? { allowedCidrs: cidrs } : {}) }
   }
   if (parent.mode === "allow" && child.mode === "allow") {
-    return { mode: "allow" as const, allowedHosts: [], writablePaths: paths }
+    return { mode: "allow" as const, allowedHosts: [], writablePaths: paths, ...(cidrs.length > 0 ? { allowedCidrs: cidrs } : {}) }
   }
   const hosts =
     parent.mode === "proxy" && child.mode === "proxy"
@@ -485,6 +695,7 @@ function intersect(parent: Snapshot, child: Snapshot) {
     mode: hosts.length > 0 ? ("proxy" as const) : ("deny" as const),
     allowedHosts: hosts,
     writablePaths: paths,
+    ...(cidrs.length > 0 ? { allowedCidrs: cidrs } : {}),
   }
 }
 
@@ -492,7 +703,7 @@ const inheritSnapshot = Effect.fn("SandboxPolicy.inheritSnapshot")(function* (
   directory: string,
   parent: Snapshot,
   sessionID: SessionID,
-  version = revision,
+  version = revision(),
 ) {
   const child = yield* read(directory, sessionID)
   const next: Snapshot = child
@@ -507,14 +718,15 @@ const inheritSnapshot = Effect.fn("SandboxPolicy.inheritSnapshot")(function* (
     child.enabled === next.enabled &&
     child.mode === next.mode &&
     child.allowedHosts.join("\0") === next.allowedHosts.join("\0") &&
-    child.writablePaths.join("\0") === next.writablePaths.join("\0")
+    child.writablePaths.join("\0") === next.writablePaths.join("\0") &&
+    cidrsEqual(child.allowedCidrs, next.allowedCidrs)
   )
     return
   yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
   const id = key(directory, sessionID)
   snapshots.set(id, next)
   synced.set(id, version)
-  yield* Effect.sync(() => changed(sessionID, directory, next))
+  yield* publishChanged(sessionID, directory, next)
 })
 
 export const inherit = Effect.fn("SandboxPolicy.inherit")(function* (
@@ -608,7 +820,61 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
       1,
       Effect.gen(function* () {
         const active = yield* current(sessionID, true)
+        const config = SandboxConfig.resolve(yield* (yield* Config.Service).get())
+        const relaxations = relaxationsFor(active.state, config)
+        if (active.state.audit === true) {
+          // Audit mode (ADR 0002): commands run UNSANDBOXED while the table
+          // that would have governed them — grants, denials, egress — is
+          // composed per command and recorded in the session log under the
+          // unsandboxed signal. Grant-table authoring aid, never silent
+          // half-enforcement. The MXC engine's allow-capture path is wired
+          // behind KILO_MXC_AUDIT_ENGINE=1 for hosts with a fixed engine; on
+          // this SDK generation it crashes the host process (documented
+          // upstream blocker), so the default is the unsandboxed dry run.
+          const ctx = yield* InstanceState.context
+          const composed = profile(
+            ctx,
+            active.state.mode,
+            active.state.writablePaths,
+            active.state.allowedHosts,
+            relaxations,
+            active.state.allowedCidrs ?? [],
+          )
+          const table = translate(composed, { command: "", args: [], cwd: ctx.directory, environment: process.env })
+          yield* Effect.promise(() =>
+            SandboxStore.appendAudit(sessionID, {
+              type: "sandbox.audit.run",
+              sessionID,
+              directory: active.directory,
+              signal: `${SandboxGate.UNSANDBOXED_SIGNAL} (audit mode)`,
+              wouldEnforce: {
+                readwrite: table.filesystem.readwritePaths,
+                readonly: table.filesystem.readonlyPaths,
+                denied: table.filesystem.deniedPaths,
+                egress: table.network.egress,
+              },
+              relaxations,
+            }),
+          )
+          if (engineAudit()) {
+            const gate = yield* SandboxGate.assess()
+            const support = backendSupport({ mode: active.state.mode, allowedHosts: active.state.allowedHosts })
+            if (gate.verdict !== "refuse" && support.available) {
+              return yield* runSandbox(
+                { ...composed, audit: { denialsPath: SandboxStore.denialsPath(sessionID) } },
+                effect,
+              )
+            }
+          }
+          return yield* unrestricted(effect)
+        }
         if (!active.state.enabled) return yield* unrestricted(effect)
+        const gate = yield* SandboxGate.assess()
+        if (gate.verdict === "refuse") {
+          // The host gate is the floor: a session never runs sandboxed on a host
+          // whose probe returned anything but the base-container tier.
+          return yield* Effect.fail(new Error(gate.reason ?? "The host cannot enforce the sandbox"))
+        }
         const support = backendSupport({ mode: active.state.mode, allowedHosts: active.state.allowedHosts })
         if (!support.available) {
           return yield* Effect.fail(new Error(support.reason ?? "The configured sandbox backend is unavailable"))
@@ -619,6 +885,8 @@ function execute<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) 
             active.state.mode,
             active.state.writablePaths,
             active.state.allowedHosts,
+            relaxations,
+            active.state.allowedCidrs ?? [],
           ),
           effect,
         )

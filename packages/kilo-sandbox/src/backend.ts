@@ -1,11 +1,12 @@
 import { Effect, PlatformError, Scope } from "effect"
 import { ChildProcess } from "effect/unstable/process"
-import { bubblewrap } from "./bubblewrap"
-import { current } from "./context"
-import { assertProcessNetwork, networkEnvironment } from "./network"
+import { bubblewrap } from "./bubblewrap.ts"
+import { current } from "./context.ts"
+import { mxc } from "./mxc.ts"
+import { assertProcessNetwork, networkEnvironment } from "./network.ts"
 import type { Profile } from "./profile"
-import { seatbelt } from "./seatbelt"
-import { currentProxy, type ProxyRuntime } from "./proxy"
+import { seatbelt } from "./seatbelt.ts"
+import { currentProxy, type ProxyRuntime } from "./proxy.ts"
 
 export interface Launch {
   readonly command: string
@@ -13,6 +14,12 @@ export interface Launch {
   readonly cwd?: string | undefined
   readonly environment?: Readonly<Record<string, string | undefined>> | undefined
   readonly shell?: boolean | string | undefined
+  // Terminal handling (ADR 0004): `stream` asks the runner to forward output
+  // live (the pipes-fallback surface for confined session terminals); absent
+  // keeps captured output. `timeoutMs` maps a caller-known deadline onto the
+  // engine's per-request timeout; absent means no engine deadline.
+  readonly stream?: boolean | undefined
+  readonly timeoutMs?: number | undefined
 }
 
 export interface Support {
@@ -36,14 +43,14 @@ function unavailable(reason: string): Backend {
   }
 }
 
-function select(): Backend {
-  switch (process.platform) {
+export function select(platform: NodeJS.Platform = process.platform): Backend {
+  switch (platform) {
     case "darwin":
       return seatbelt
     case "linux":
       return bubblewrap
     case "win32":
-      return unavailable("The Windows sandbox backend is not available")
+      return mxc
     default:
       return unavailable("No sandbox backend is available for this operating system")
   }

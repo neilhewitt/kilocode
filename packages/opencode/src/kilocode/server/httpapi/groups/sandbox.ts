@@ -17,12 +17,29 @@ export const SandboxStatus = Schema.Struct({
   enabled: Schema.Boolean,
   available: Schema.Boolean,
   reason: Schema.optional(Schema.String),
+  diagnostics: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
+  unsandboxed: Schema.optional(Schema.Boolean),
+  audit: Schema.optional(Schema.Boolean),
   version: Schema.Int,
 })
 
 export const SandboxSupport = Schema.Struct({
   available: Schema.Boolean,
   reason: Schema.optional(Schema.String),
+})
+
+export const SandboxGatePayload = Schema.Struct({
+  choice: Schema.Literals(["abort", "continue-unsandboxed"]),
+})
+
+export const SandboxRelaxPayload = Schema.Struct({
+  kind: Schema.Literals(["path", "terminal"]),
+  access: Schema.optional(Schema.Literals(["read", "write"])),
+  path: Schema.optional(Schema.String),
+  reason: Schema.optional(Schema.String),
+}).annotate({
+  description:
+    "A relaxation request for the current session: a path relaxation grants read or write outside the default grant table; the terminal kind is the PTY relaxation hook. Granted relaxations apply to this session only and are recorded in the session log.",
 })
 
 export const SandboxApi = HttpApi.make("sandbox")
@@ -61,6 +78,34 @@ export const SandboxApi = HttpApi.make("sandbox")
             identifier: "sandbox.toggle",
             summary: "Toggle session sandbox",
             description: "Toggle and persist the sandbox state for one session.",
+          }),
+        ),
+        HttpApiEndpoint.post("gate", `${root}/gate`, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SandboxGatePayload,
+          success: described(SandboxStatus, "Resolved session sandbox gate status"),
+          error: ApiNotFoundError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "sandbox.gate",
+            summary: "Resolve the sandbox host gate",
+            description:
+              "Resolve a host-gate refusal for one session: abort, or continue unsandboxed with unmistakable signalling and an audit record of what would have been denied.",
+          }),
+        ),
+        HttpApiEndpoint.post("relax", `${root}/relax`, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: SandboxRelaxPayload,
+          success: described(SandboxStatus, "Session sandbox status after the relaxation"),
+          error: ApiNotFoundError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "sandbox.relax",
+            summary: "Grant a session relaxation",
+            description:
+              "Grant one relaxation for the current session — the surface the permission prompt and the PTY relaxation plug into. The grant is recorded in the session log with its source.",
           }),
         ),
       )
