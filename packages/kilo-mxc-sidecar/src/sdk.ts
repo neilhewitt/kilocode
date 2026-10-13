@@ -39,7 +39,7 @@ type MxcChild = {
   standardOutput: NodeJS.ReadableStream | null
   standardError: NodeJS.ReadableStream | null
   wait: () => Promise<{ exitCode: number; timedOut: boolean }>
-  warnings?: (() => unknown) | unknown
+  warnings?: unknown
   kill: () => void
 }
 
@@ -65,6 +65,7 @@ export function toSdkRequest(command: RunCommand): Record<string, unknown> {
       deniedPaths: [...command.filesystem.deniedPaths],
     },
     network: { egress: { default: command.network.egress.default } },
+    ui: { disable: command.ui.disable },
     environment: { ...command.environment },
     inheritDefaultEnvironment: true,
   }

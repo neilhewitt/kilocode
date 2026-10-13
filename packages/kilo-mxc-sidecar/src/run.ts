@@ -8,6 +8,16 @@ export type RunEgress = {
   readonly default: "allow" | "deny"
 }
 
+// The UI posture of the run. `disable` is the MXC kill switch for the GUI
+// subsystem; it must stay false for ordinary development tooling (node, git,
+// PowerShell all import USER32.dll, whose DLL initialisation dies with
+// 0xC0000142 under DisallowWin32kSystemCalls). Everything else — clipboard,
+// input injection, desktop control, system settings, IME — remains denied by
+// the MXC UI policy's default-deny fields whenever the subsystem is enabled.
+export type RunUi = {
+  readonly disable: boolean
+}
+
 export type RunCommand = {
   readonly command: string
   readonly workingDirectory?: string | undefined
@@ -19,6 +29,7 @@ export type RunCommand = {
   readonly network: {
     readonly egress: RunEgress
   }
+  readonly ui: RunUi
   readonly environment: Readonly<Record<string, string>>
 }
 
@@ -64,6 +75,8 @@ export function isRunCommand(value: unknown): value is RunCommand {
   const network = value["network"]
   if (!isRecord(network)) return false
   if (!isEgress(network["egress"])) return false
+  const ui = value["ui"]
+  if (!isRecord(ui) || typeof ui["disable"] !== "boolean") return false
   const environment = value["environment"]
   if (!isRecord(environment) || Array.isArray(environment)) return false
   return Object.values(environment).every((entry) => typeof entry === "string")

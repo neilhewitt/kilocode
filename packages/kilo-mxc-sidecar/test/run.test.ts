@@ -1,7 +1,7 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 import { createControlServer } from "../src/control.ts"
-import type { RunCommand, RunHandle, RunResult } from "../src/run.ts"
+import { isRunCommand, type RunCommand, type RunHandle, type RunResult } from "../src/run.ts"
 import type { Runtime } from "../src/sdk.ts"
 import { generateToken } from "../src/auth.ts"
 import { controlEndpoint } from "../src/endpoint.ts"
@@ -21,6 +21,7 @@ function runCommand(partial: Partial<RunCommand> = {}): RunCommand {
       deniedPaths: ["C:\\workspace\\.env"],
     },
     network: { egress: { default: "deny" } },
+    ui: { disable: false },
     environment: { PATH: "C:\\Windows\\System32" },
     ...partial,
   }
@@ -63,6 +64,16 @@ function hanging(started: () => void): { runtime: Runtime; killed: () => boolean
 function id() {
   return Math.random().toString(16).slice(2, 10)
 }
+
+describe("run command contract", () => {
+  test("accepts a run command with the UI posture and rejects one without it", () => {
+    assert.equal(isRunCommand(runCommand()), true)
+    const { ui, ...withoutUi } = runCommand()
+    assert.ok(ui)
+    assert.equal(isRunCommand(withoutUi), false, "the UI posture is part of the contract")
+    assert.equal(isRunCommand(runCommand({ ui: { disable: "no" as unknown as boolean } })), false, "disable must be a boolean")
+  })
+})
 
 describe("control channel run", () => {
   test("runs a command and returns its captured stdout, stderr, and exit code", async () => {

@@ -43,6 +43,7 @@ const payload = {
     deniedPaths: [],
   },
   network: { egress: { default: "deny" } },
+  ui: { disable: false },
   environment: { PATH: "C:\\Windows\\System32" },
 }
 
