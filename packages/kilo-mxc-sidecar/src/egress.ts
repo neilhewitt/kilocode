@@ -8,7 +8,7 @@
 
 import { createEgressProxy, type EgressProxy } from "./proxy.ts"
 import type { CidrPortRule, RunCommand, RunHandle, RunResult } from "./run.ts"
-import type { RunBindings, Runtime } from "./sdk.ts"
+import type { RunBindings, RunOptions, Runtime } from "./sdk.ts"
 
 export type EgressRuntime = Runtime & {
   readonly closeProxies: () => Promise<void>
@@ -50,18 +50,18 @@ export function withEgressProxy(runtime: Runtime): EgressRuntime {
     kill: handle.kill,
   })
 
-  const run = async (command: RunCommand, bindings: RunBindings = {}): Promise<RunHandle> => {
+  const run = async (command: RunCommand, bindings: RunBindings = {}, options: RunOptions = {}): Promise<RunHandle> => {
     const egress = command.network.egress
     if (egress.default !== "proxy") {
       const warnings = relaxationsFor(command)
-      const handle = await runtime.run(command, bindings)
+      const handle = await runtime.run(command, bindings, options)
       return warnings.length > 0 ? annotate(handle, warnings) : handle
     }
     const proxy = await createEgressProxy({ allowedHosts: egress.allowedHosts })
     const release = track(proxy)
     const settle = () => release()
     try {
-      const handle = await runtime.run(command, { ...bindings, networkProxy: proxy.endpoint })
+      const handle = await runtime.run(command, { ...bindings, networkProxy: proxy.endpoint }, options)
       return {
         wait: () => handle.wait().finally(settle),
         kill: () => {

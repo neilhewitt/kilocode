@@ -142,6 +142,22 @@ describe("run command contract", () => {
     assert.equal(isRunCommand(runCommand({ audit: { mode: "block" } as unknown as RunCommand["audit"] })), false, "mode is not part of the wire contract — allow-capture is the only audit posture")
     assert.equal(isRunCommand(runCommand({ audit: "yes" as unknown as RunCommand["audit"] })), false)
   })
+
+  test("accepts an optional per-request timeout in whole milliseconds", () => {
+    assert.equal(isRunCommand(runCommand({ timeoutMs: 60_000 })), true, "the engine's deadline is part of the contract")
+    assert.equal(isRunCommand(runCommand({ timeoutMs: 1 })), true)
+    assert.equal(isRunCommand(runCommand({ timeoutMs: 0 })), false, "zero milliseconds is no timeout, not a deadline")
+    assert.equal(isRunCommand(runCommand({ timeoutMs: 1.5 })), false, "the deadline is whole milliseconds")
+    assert.equal(isRunCommand(runCommand({ timeoutMs: -1 })), false)
+    assert.equal(isRunCommand(runCommand({ timeoutMs: "60" as unknown as number })), false)
+  })
+
+  test("accepts the streamed-output flag and rejects anything else", () => {
+    assert.equal(isRunCommand(runCommand({ stream: true })), true, "a streamed run forwards output live")
+    assert.equal(isRunCommand(runCommand({ stream: false })), true)
+    assert.equal(isRunCommand(runCommand({ stream: "yes" as unknown as boolean })), false)
+    assert.equal(isRunCommand(runCommand({ stream: 1 as unknown as boolean })), false)
+  })
 })
 
 describe("control channel run", () => {

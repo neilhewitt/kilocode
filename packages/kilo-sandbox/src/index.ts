@@ -31,3 +31,7 @@ export {
   type EgressPostureInput,
 } from "./egress"
 export { CurrentProxyFactory, startProxy, type ProxyFactory, type ProxyResolver } from "./proxy"
+// Terminal handling (ADR 0004): the pipes fallback decision surface.
+export type { PipesTty, TerminalDecision } from "./terminal"
+export { PIPES_FALLBACK_SIGNAL, PTY_REVISIT_TRIGGER, pipesTty, terminalDecision } from "./terminal"
+export { confine } from "./backend"

@@ -14,6 +14,12 @@ export interface Launch {
   readonly cwd?: string | undefined
   readonly environment?: Readonly<Record<string, string | undefined>> | undefined
   readonly shell?: boolean | string | undefined
+  // Terminal handling (ADR 0004): `stream` asks the runner to forward output
+  // live (the pipes-fallback surface for confined session terminals); absent
+  // keeps captured output. `timeoutMs` maps a caller-known deadline onto the
+  // engine's per-request timeout; absent means no engine deadline.
+  readonly stream?: boolean | undefined
+  readonly timeoutMs?: number | undefined
 }
 
 export interface Support {

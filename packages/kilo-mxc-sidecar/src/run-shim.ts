@@ -34,9 +34,26 @@ try {
 let code = 1
 try {
   await sidecar.handshake()
-  const result = await sidecar.run(command)
-  if (result.stdout !== "") process.stdout.write(result.stdout)
-  if (result.stderr !== "") process.stderr.write(result.stderr)
+  // A streamed (pipes-fallback terminal, ADR 0004) run pipes its output
+  // through as it arrives instead of replaying it at the end: the agent's own
+  // stdout/stderr are the consumer, and the captured result's stdout/stderr
+  // are deliberately not replayed (they were already delivered — replaying
+  // them would double every byte). Warnings and the exit code still complete
+  // the run exactly as capture-mode does, so captured and streamed commands
+  // settle identically.
+  let replayCapture = true
+  const result = await sidecar.run(command, {
+    onOutput: (stream, data) => {
+      if (command.stream !== true) return
+      const out = stream === "stdout" ? process.stdout : process.stderr
+      replayCapture = false
+      out.write(Buffer.from(data))
+    },
+  })
+  if (replayCapture) {
+    if (result.stdout !== "") process.stdout.write(result.stdout)
+    if (result.stderr !== "") process.stderr.write(result.stderr)
+  }
   for (const warning of result.warnings) process.stderr.write(`[kilo-mxc] ${warning}\n`)
   code = result.exitCode
 } catch (cause) {

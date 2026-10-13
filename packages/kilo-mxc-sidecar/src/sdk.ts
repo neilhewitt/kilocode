@@ -10,7 +10,7 @@
 // composed: ambient telemetry keys pass through byte-identical, and the sidecar
 // itself can never introduce one.
 
-import type { RunCommand, RunHandle, RunResult } from "./run.ts"
+import { PIPES_FALLBACK_WARNING, type RunCommand, type RunHandle, type RunResult } from "./run.ts"
 
 export type PlatformSupport = object
 
@@ -23,7 +23,7 @@ export type RunBindings = {
 
 export type Runtime = {
   getPlatformSupport: () => Promise<PlatformSupport>
-  run: (command: RunCommand, bindings?: RunBindings) => Promise<RunHandle>
+  run: (command: RunCommand, bindings?: RunBindings, options?: RunOptions) => Promise<RunHandle>
 }
 export const TELEMETRY_KEY_PATTERN = /telemetry/i
 
@@ -119,6 +119,9 @@ export function toSdkRequest(command: RunCommand, bindings: RunBindings = {}): R
   return {
     command: command.command,
     ...(command.workingDirectory === undefined ? {} : { workingDirectory: command.workingDirectory }),
+    // ADR 0004: existing timeout semantics map onto the engine's per-request
+    // deadline; absent means the engine applies none.
+    ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
     containment: containment(command),
     filesystem: {
       readwritePaths: [...command.filesystem.readwritePaths],
@@ -130,6 +133,14 @@ export function toSdkRequest(command: RunCommand, bindings: RunBindings = {}): R
     environment: { ...command.environment },
     inheritDefaultEnvironment: true,
   }
+}
+
+// Options the sidecar ties to a run but that are not caller policy:
+// `forward` receives stdout/stderr chunks the moment the engine emits them,
+// for streamed (pipes-fallback) runs. Chunks are forwarded in arrival order
+// alongside the final captured result, never instead of it.
+export type RunOptions = {
+  readonly forward?: ((stream: "stdout" | "stderr", chunk: Uint8Array) => void) | undefined
 }
 
 // The captureDenials summary a finished run exposes, extracted from the SDK's
@@ -156,17 +167,27 @@ export function runThrough(
   sdk: Pick<SdkModule, "spawn">,
   command: RunCommand,
   bindings: RunBindings = {},
+  options: RunOptions = {},
 ): Promise<RunHandle> {
   return sdk.spawn(toSdkRequest(command, bindings)).then((child) => {
     // Streams must be taken before wait(): waiting drains untaken output
     // internally and later access throws.
-    const collect = (stream: NodeJS.ReadableStream | null) => {
+    const collect = (stream: NodeJS.ReadableStream | null, forward?: RunOptions["forward"]): (() => string) => {
       const chunks: Buffer[] = []
-      if (stream) stream.on("data", (chunk: Buffer) => chunks.push(chunk))
+      if (stream) {
+        stream.on("data", (chunk: Buffer) => {
+          chunks.push(chunk)
+          // A streamed run surfaces output the moment it arrives — the pipes
+          // fallback's live surface — while the captured result below stays
+          // the one source of truth for the completed run either way.
+          if (forward) forward(stream === child.standardOutput ? "stdout" : "stderr", new Uint8Array(chunk))
+        })
+      }
       return () => Buffer.concat(chunks).toString("utf8")
     }
-    const stdout = collect(child.standardOutput)
-    const stderr = collect(child.standardError)
+    const forward = command.stream === true ? options.forward : undefined
+    const stdout = collect(child.standardOutput, forward)
+    const stderr = collect(child.standardError, forward)
     const wait = child.wait().then(
       (result): RunResult => {
         const audit = auditOf(child)
@@ -175,7 +196,11 @@ export function runThrough(
           stdout: stdout(),
           stderr: stderr(),
           timedOut: result.timedOut,
-          warnings: warningsOf(child),
+          // The streamed surface always announces itself: a consumer of live
+          // output must know it was watching a pipes-fallback run — confined,
+          // no TTY — and never mistake it for a terminal.
+          warnings:
+            command.stream === true ? [...warningsOf(child), PIPES_FALLBACK_WARNING] : warningsOf(child),
           ...(audit === undefined ? {} : { audit }),
         }
       },

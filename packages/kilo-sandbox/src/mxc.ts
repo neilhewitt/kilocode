@@ -319,6 +319,12 @@ export function translate(profile: Profile, launch: Launch): RunCommand {
     network: { egress: egressOf(profile.network) },
     ui: uiDefaults(),
     environment: redirectCaches(safeEnvironment(launch.environment), temporary !== undefined && existsSync(temporary) ? temporary : undefined),
+    // Terminal handling (ADR 0004): the MXC engine cannot give a confined
+    // command a PTY (see PTY_REVISIT_TRIGGER), so a streamed ask is the
+    // pipes-fallback's live surface and passing deadlines map onto the
+    // engine's per-request timeout.
+    ...(launch.stream === true ? { stream: true } : {}),
+    ...(launch.timeoutMs === undefined ? {} : { timeoutMs: launch.timeoutMs }),
     ...(profile.audit === undefined
       ? {}
       : {

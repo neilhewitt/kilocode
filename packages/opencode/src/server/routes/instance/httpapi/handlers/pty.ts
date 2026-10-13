@@ -24,6 +24,9 @@ import { InstanceHttpApi } from "../api"
 import * as ApiError from "../errors"
 import { CursorQuery, PtyConnectApi } from "../groups/pty"
 import { WebSocketTracker } from "../websocket-tracker"
+// kilocode_change - ticket 17: module eval installs the sandbox-aware terminal
+// spawn gate (the confined pipes fallback; ADR 0004 sidecar surface).
+import "@/kilocode/sandbox/terminal"
 
 function validOrigin(request: HttpServerRequest.HttpServerRequest, opts: CorsOptions | undefined) {
   return isAllowedRequestOrigin(request.headers.origin, request.headers.host, opts)

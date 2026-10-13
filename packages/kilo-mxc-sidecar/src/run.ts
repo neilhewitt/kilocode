@@ -50,6 +50,14 @@ export type RunAudit = {
   readonly denialsPath?: string | undefined
 }
 
+// The degradation signal a streamed (pipes-fallback) run always carries: the
+// sidecar cannot import the sandbox package's wording (dependency direction —
+// the sandbox packages depends on this one), so the two agree on one message.
+// The shim prints warnings as `[kilo-mxc] …` lines, so this is what the user
+// of a pipes-fallback terminal sees.
+export const PIPES_FALLBACK_WARNING =
+  "pipes fallback: no TTY — the sandbox engine does not support PTY spawning (tracked upstream, ADR 0004); input and resize are unavailable — grant a terminal relaxation for a real terminal"
+
 export type RunCommand = {
   readonly command: string
   readonly workingDirectory?: string | undefined
@@ -64,6 +72,21 @@ export type RunCommand = {
   readonly ui: RunUi
   readonly environment: Readonly<Record<string, string>>
   readonly audit?: RunAudit | undefined
+  // The engine-side per-request deadline in whole milliseconds (ADR 0004:
+  // "existing timeout semantics map onto `timeoutMs`"). Callers that know a
+  // command's remaining timeout budget pass it so the MXC engine enforces the
+  // same deadline; a hung confined command then settles with `timedOut: true`
+  // instead of outliving every other kill path. Absent means no engine deadline.
+  readonly timeoutMs?: number | undefined
+  // The pipes fallback (ADR 0004): the MXC engine refuses PTY spawning for the
+  // processcontainer backend (typed `unsupported_containment` from
+  // spawnWithPty; revisit when upstream ships PTY spawning there), so every
+  // confined command runs over pipes. `stream` asks the sidecar to forward
+  // stdout/stderr chunks over the control channel as they arrive instead of
+  // only settling the captured RunResult at the end — the streamed surface
+  // needed by the pipes-backed session terminal. Input is not carried in
+  // either mode: confined pipes are one-way.
+  readonly stream?: boolean | undefined
 }
 
 // The engine's denial-capture summary for a completed run. Present only when
@@ -161,5 +184,10 @@ export function isRunCommand(value: unknown): value is RunCommand {
   if (!isRecord(environment) || Array.isArray(environment)) return false
   const audit = value["audit"]
   if (audit !== undefined && !isAudit(audit)) return false
+  if (value["timeoutMs"] !== undefined) {
+    const timeoutMs = value["timeoutMs"]
+    if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) return false
+  }
+  if (value["stream"] !== undefined && typeof value["stream"] !== "boolean") return false
   return Object.values(environment).every((entry) => typeof entry === "string")
 }

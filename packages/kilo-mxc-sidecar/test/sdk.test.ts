@@ -1,4 +1,5 @@
 import { describe, test } from "node:test"
+import { PIPES_FALLBACK_WARNING } from "../src/run.ts"
 import assert from "node:assert/strict"
 import os from "node:os"
 import { runThrough, sdkEnv, toSdkRequest, type SdkModule } from "../src/sdk.ts"
@@ -197,5 +198,108 @@ describe("SDK request network composition", () => {
       ingress: { default: "allow", hostLoopback: "allow" },
       runtimeConfig: { networkProxy: "http://127.0.0.1:9999" },
     })
+  })
+})
+
+describe("SDK request timeout composition", () => {
+  test("the run command's deadline maps onto the engine's per-request timeout", () => {
+    const request = toSdkRequest(command({ default: "deny" }))
+    assert.equal("timeoutMs" in request, false, "an absent deadline stays absent on the wire")
+    const timed = toSdkRequest({ ...command({ default: "deny" }), timeoutMs: 60_000 })
+    assert.equal(timed.timeoutMs, 60_000, "the deadline reaches the engine as timeoutMs")
+  })
+})
+
+describe("streamed output forwarding", () => {
+  class Emitter {
+    readonly listeners = new Map<string, (chunk: Buffer) => void>()
+    on(event: string, listener: (chunk: Buffer) => void) {
+      this.listeners.set(event, listener)
+      return this
+    }
+    push(chunk: Buffer) {
+      this.listeners.get("data")?.(chunk)
+    }
+  }
+
+  function streamingChild(settle?: { exitCode: number; timedOut: boolean }) {
+    const stdout = new Emitter()
+    const stderr = new Emitter()
+    let release: ((result: { exitCode: number; timedOut: boolean }) => void) | undefined
+    const exited = new Promise<{ exitCode: number; timedOut: boolean }>((resolve) => {
+      release = resolve
+    })
+    if (settle !== undefined) release?.(settle)
+    return {
+      child: {
+        standardOutput: stdout as unknown as NodeJS.ReadableStream,
+        standardError: stderr as unknown as NodeJS.ReadableStream,
+        wait: () => exited,
+        warnings: ["streamed warning"],
+        kill: () => {},
+      },
+      exit: (result: { exitCode: number; timedOut: boolean }) => release?.(result),
+      stdout,
+      stderr,
+    }
+  }
+
+  test("a streamed run forwards stdout and stderr chunks live before completion", async () => {
+    const streamed = { ...command({ default: "deny" }), stream: true } as RunCommand
+    const live: Array<{ stream: string; text: string }> = []
+    const harness = streamingChild()
+    const handle = await runThrough({ spawn: async () => harness.child }, streamed, {}, {
+      forward: (stream, chunk) => {
+        live.push({ stream, text: new TextDecoder().decode(chunk) })
+      },
+    })
+    harness.stdout.push(Buffer.from("first out; "))
+    harness.stderr.push(Buffer.from("first err; "))
+    harness.stdout.push(Buffer.from("second out"))
+    assert.deepEqual(live[0], { stream: "stdout", text: "first out; " })
+    assert.deepEqual(live[1], { stream: "stderr", text: "first err; " })
+    assert.deepEqual(live[2], { stream: "stdout", text: "second out" })
+    const settled = await Promise.race([handle.wait().then(() => "settled"), Promise.resolve("pending")])
+    assert.equal(settled, "pending", "forwarding must not wait for completion")
+  })
+
+  test("the captured result of a streamed run is still complete and identical to capture-mode", async () => {
+    const streamed = { ...command({ default: "deny" }), stream: true } as RunCommand
+    const harness = streamingChild()
+    const handle = await runThrough({ spawn: async () => harness.child }, streamed, {}, { forward: () => undefined })
+    harness.stdout.push(Buffer.from("streamed out"))
+    harness.exit({ exitCode: 0, timedOut: false })
+    const result = await handle.wait()
+    // The degradation signal rides every streamed run's warnings — the
+    // visible proof that this is the pipes fallback, not a terminal.
+    assert.deepEqual(result, {
+      exitCode: 0,
+      stdout: "streamed out",
+      stderr: "",
+      timedOut: false,
+      warnings: ["streamed warning", PIPES_FALLBACK_WARNING],
+    })
+  })
+
+  test("a captured run's warnings are never annotated with the fallback", async () => {
+    const harness = streamingChild({ exitCode: 0, timedOut: false })
+    const handle = await runThrough({ spawn: async () => harness.child }, command({ default: "deny" }))
+    harness.stdout.push(Buffer.from("captured"))
+    const result = await handle.wait()
+    assert.deepEqual(result.warnings, ["streamed warning"], "capture-mode output stays unannotated")
+  })
+
+  test("a captured run never invokes a forward hook", async () => {
+    const live: Array<{ stream: string; text: string }> = []
+    const harness = streamingChild({ exitCode: 0, timedOut: false })
+    const handle = await runThrough(
+      { spawn: async () => harness.child },
+      command({ default: "deny" }),
+      {},
+      { forward: (stream, chunk) => live.push({ stream, text: new TextDecoder().decode(chunk) }) },
+    )
+    harness.stdout.push(Buffer.from("should not forward"))
+    await handle.wait()
+    assert.deepEqual(live, [], "capture-mode output stays buffered to completion")
   })
 })

@@ -21,7 +21,7 @@ export function createRuntime() {
         source: "scripted",
       }
     },
-    run: async (command, bindings) => {
+    run: async (command, bindings, options) => {
       event({ type: "run", command, bindings: bindings ?? {} })
       const canned = JSON.parse(process.env.KILO_MXC_SCRIPT_RESULT ?? "{}")
       const result = {
@@ -30,6 +30,14 @@ export function createRuntime() {
         stderr: canned.stderr ?? "",
         timedOut: canned.timedOut ?? false,
         warnings: canned.warnings ?? [],
+      }
+      // A streamed run: forward the scripted chunks through the options'
+      // forward hook exactly as a live engine would, then settle as usual.
+      if (command.stream === true && typeof options?.forward === "function") {
+        const out = process.env.KILO_MXC_SCRIPT_STREAM_OUT
+        if (out !== undefined && out !== "") event({ type: "forward", stream: "stdout" }) || options.forward("stdout", Buffer.from(out))
+        const err = process.env.KILO_MXC_SCRIPT_STREAM_ERR
+        if (err !== undefined && err !== "") event({ type: "forward", stream: "stderr" }) || options.forward("stderr", Buffer.from(err))
       }
       if (process.env.KILO_MXC_SCRIPT_HANG === "1") {
         return {

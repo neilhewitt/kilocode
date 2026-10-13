@@ -13,6 +13,8 @@ import { lazy } from "./util/lazy"
 import { KiloPtySelfCommand } from "./kilocode/pty-self-command" // kilocode_change
 import * as KiloPtyRegistry from "./kilocode/pty/registry" // kilocode_change
 import type { Active, Subscriber } from "./kilocode/pty/registry" // kilocode_change
+import * as KiloPtySpawnGate from "./kilocode/pty/spawn-gate" // kilocode_change
+import type { Proc } from "./pty/pty" // kilocode_change
 
 const BUFFER_LIMIT = 1024 * 1024 * 2
 // Exited sessions stay observable (status, exit code, retained output) until removed explicitly.
@@ -191,17 +193,43 @@ const layer = Layer.effect(
         env.LANG = "C.UTF-8"
       }
       yield* Effect.logInfo("creating session", { id, cmd: command, args, cwd })
-      const { spawn } = yield* Effect.promise(() => pty())
-      // kilocode_change start - spawn with initial terminal dimensions
-      const proc = yield* Effect.sync(() =>
-        spawn(command, args, {
-          name: "xterm-256color",
+      // kilocode_change start - ticket 17: consult the sandbox-aware spawn gate
+      // first. Under sandbox mode the gate swaps the ConPTY spawn for the
+      // confined pipes fallback (no TTY: the MXC engine refuses PTY spawning
+      // for the processcontainer backend — PTY_REVISIT_TRIGGER); with no gate
+      // installed (non-Kilo host) or a "pty" decision this stays as before.
+      let proc: Proc | undefined
+      let procIsPipes = false
+      const gate = KiloPtySpawnGate.current()
+      if (gate) {
+        // A gate failure is a defect (fail-closed): the create never silently
+        // degrades to an unconsulted plain PTY.
+        const decision = yield* gate({
+          command,
+          args,
           cwd,
           env,
-          cols: input.size?.cols,
-          rows: input.size?.rows,
-        }),
-      )
+          sessionID: input.sessionID,
+          directory: owner.directory,
+        }).pipe(Effect.orDie)
+        if (decision.mode === "pipes") {
+          proc = decision.proc
+          procIsPipes = true
+        }
+      }
+      if (proc === undefined) {
+        const { spawn } = yield* Effect.promise(() => pty())
+        // kilocode_change - spawn with initial terminal dimensions
+        proc = yield* Effect.sync(() =>
+          spawn(command, args, {
+            name: "xterm-256color",
+            cwd,
+            env,
+            cols: input.size?.cols,
+            rows: input.size?.rows,
+          }),
+        )
+      }
       // kilocode_change end
       const info: Info = {
         id,
@@ -211,6 +239,8 @@ const layer = Layer.effect(
         cwd,
         status: "running",
         pid: proc.pid,
+        // kilocode_change - ticket 17: surface which terminal posture was granted
+        ...(procIsPipes ? { tty: "pipes" } : {}),
       }
       const session: Active = {
         info,

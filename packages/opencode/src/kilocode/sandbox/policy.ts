@@ -7,6 +7,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import {
   backendSupport,
   deniedByProfile,
+  isRelaxation,
   run as runSandbox,
   translate,
   unrestricted,
@@ -641,6 +642,43 @@ export const relax = Effect.fn("SandboxPolicy.relax")(function* (sessionID: Sess
       }
       yield* Effect.promise(() => Bus.publish(Instance.current, Changed, { sessionID, ...value }))
       return value
+    })
+  )
+})
+
+// Ticket 17 — the PTY surface's consumption of a prompt-granted terminal
+// relaxation (ADR 0004). The grant is stored with the session snapshot like
+// any prompt relaxation, but kind "terminal" blesses exactly one terminal
+// spawn: consuming removes every terminal entry from the snapshot and records
+// the use in the session log. Durable config entries never pass through here
+// (they are re-composed from config each time and removed from config when
+// the posture should end).
+export const consumeTerminalGrant = Effect.fn("SandboxPolicy.consumeTerminalGrant")(function* (
+  sessionID: SessionID,
+  directory: string,
+) {
+  return yield* locked(
+    sessionID,
+    Effect.gen(function* () {
+      const stored = yield* read(directory, sessionID)
+      if (!stored) return false
+      const relaxations = (stored.relaxations ?? []).filter((entry) => !isRelaxation(entry) || entry.kind !== "terminal")
+      if (relaxations.length === (stored.relaxations ?? []).length) return false
+      const next: Snapshot = { ...stored, relaxations, version: stored.version + 1 }
+      yield* Effect.promise(() => SandboxStore.write(directory, sessionID, next))
+      const id = key(directory, sessionID)
+      snapshots.set(id, next)
+      synced.set(id, revision)
+      yield* Effect.promise(() =>
+        SandboxStore.appendAudit(sessionID, {
+          type: "sandbox.terminal.use",
+          sessionID,
+          directory,
+          kind: "terminal",
+          note: "the recorded PTY relaxation was consumed by one terminal spawn",
+        }),
+      )
+      return true
     }),
   )
 })

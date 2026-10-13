@@ -23,7 +23,7 @@ export type Sidecar = {
   exitCode: number | null
   handshake: () => Promise<Handshake>
   platformSupport: () => Promise<Record<string, unknown>>
-  run: (command: RunCommand) => Promise<RunResult>
+  run: (command: RunCommand, options?: { onOutput?: (stream: "stdout" | "stderr", data: Uint8Array) => void }) => Promise<RunResult>
   shutdown: () => Promise<void>
   stop: () => void
   orphan: () => void
@@ -99,8 +99,13 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
     closed = true
     for (const waiter of waiting.values()) waiter.reject(new Error("the sidecar connection closed"))
     waiting.clear()
+    outputs.clear()
   })
   socket.on("error", () => {})
+  // A streamed run interleaves mid-run event frames with the settled response
+  // on the same connection; frames carry the run request's id and are routed
+  // to that request's output sink without ever consuming its waiter.
+  const outputs = new Map<number, (stream: "stdout" | "stderr", data: Uint8Array) => void>()
   socket.on("data", (chunk: string) => {
     buffer += chunk
     let index: number
@@ -109,21 +114,34 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
       buffer = buffer.slice(index + 1)
       if (!line.trim()) continue
       const response = JSON.parse(line)
+      if (typeof response.event === "string") {
+        const output = outputs.get(response.id)
+        if (output) {
+          output(response.event === "stderr" ? "stderr" : "stdout", new Uint8Array(Buffer.from(String(response.data ?? ""), "base64")))
+        }
+        continue
+      }
       const waiter = waiting.get(response.id)
       if (!waiter) continue
       waiting.delete(response.id)
+      outputs.delete(response.id)
       if (response.ok) waiter.resolve(response.result)
       else waiter.reject(new ControlError(response.error.code, response.error.message))
     }
   })
 
-  const call = <T>(method: string, extra: Record<string, unknown> = {}) =>
+  const call = <T>(
+    method: string,
+    extra: Record<string, unknown> = {},
+    output?: (stream: "stdout" | "stderr", data: Uint8Array) => void,
+  ) =>
     new Promise<T>((resolve, reject) => {
       if (closed) {
         reject(new Error("the sidecar connection closed"))
         return
       }
       const requestId = ++next
+      if (output) outputs.set(requestId, output)
       waiting.set(requestId, { resolve: resolve as (result: any) => void, reject })
       socket.write(JSON.stringify({ id: requestId, method, ...extra }) + "\n")
     })
@@ -140,7 +158,8 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
     },
     handshake: () => call<Handshake>("handshake", { token }),
     platformSupport: () => call<Record<string, unknown>>("platformSupport"),
-    run: (command: RunCommand) => call<RunResult>("run", { run: command }),
+    run: (command: RunCommand, options: { onOutput?: (stream: "stdout" | "stderr", data: Uint8Array) => void } = {}) =>
+    call<RunResult>("run", { run: command }, command.stream === true ? options.onOutput : undefined),
     shutdown: async () => {
       await call("shutdown")
       await new Promise<void>((resolve) => {

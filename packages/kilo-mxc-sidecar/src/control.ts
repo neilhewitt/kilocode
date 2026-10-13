@@ -25,8 +25,23 @@ export type ControlOptions = {
   token: string
 }
 
-function respond(socket: net.Socket, response: Response) {
+function respond(socket: net.Socket, response: Response | StreamEvent) {
   return new Promise<void>((resolve) => socket.write(JSON.stringify(response) + "\n", () => resolve()))
+}
+
+// A streamed run's mid-run frame: stdout/stderr chunks are forwarded over the
+// owning connection as they arrive, ending at the settled response. Chunk bytes
+// are base64-encoded so NDJSON framing can never be broken by their contents.
+// The frame shares the request's id; clients waiting for `ok`/`error` must not
+// treat it as the response.
+export type StreamEvent = {
+  readonly id: number
+  readonly event: "stdout" | "stderr"
+  readonly data: string
+}
+
+export function event(id: number, stream: "stdout" | "stderr", data: Uint8Array): StreamEvent {
+  return { id, event: stream, data: Buffer.from(data).toString("base64") }
 }
 
 export function createControlServer(options: ControlOptions): ControlServer {
@@ -62,7 +77,17 @@ export function createControlServer(options: ControlOptions): ControlServer {
       }
       let execution: RunHandle
       try {
-        execution = await runtime.run(request.run)
+        // A streamed run ties the engine's live output to this connection.
+        // The settled response below still carries the full captured result;
+        // the frames only make it observable as it happens.
+        const options = request.run.stream === true
+          ? {
+              forward: (stream: "stdout" | "stderr", chunk: Uint8Array) => {
+                void respond(socket, event(request.id, stream, chunk))
+              },
+            }
+          : undefined
+        execution = await runtime.run(request.run, undefined, options)
       } catch (cause) {
         await respond(socket, error(request.id, "internal_error", cause instanceof Error ? cause.message : String(cause)))
         return

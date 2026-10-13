@@ -12,6 +12,7 @@ import { createEgressProxy } from "@kilocode/mxc-sidecar"
 import type { Launch } from "../src/backend.ts"
 import { confine, select } from "../src/backend.ts"
 import { mxc, quoteWindows, supportFor, translate } from "../src/mxc.ts"
+import { isRunCommand } from "@kilocode/mxc-sidecar"
 import { bubblewrap } from "../src/bubblewrap.ts"
 import { seatbelt } from "../src/seatbelt.ts"
 import type { Profile } from "../src/profile.ts"
@@ -408,6 +409,47 @@ describe("mxc policy translation", () => {
   })
 })
 
+describe("terminal handling (ADR 0004)", () => {
+  test("a pipes-fallback launch's stream ask lands on the run command", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-terminal-"))
+    try {
+      const streamed = translate(profile(root), { ...launch(root), stream: true } as Launch)
+      assert.equal(streamed.stream, true, "the streamed ask rides the translated request the shim carries")
+      const captured = translate(profile(root), launch(root))
+      assert.equal(captured.stream, undefined, "capture-mode stays the default posture")
+      assert.equal(isRunCommand(streamed), true, "the streamed request satisfies the sidecar's wire contract")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a launch deadline maps onto the run's per-request timeout", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-terminal-"))
+    try {
+      const translated = translate(profile(root), { ...launch(root), timeoutMs: 30_000 } as unknown as Launch)
+      assert.equal(translated.timeoutMs, 30_000)
+      assert.equal(translate(profile(root), launch(root)).timeoutMs, undefined, "no deadline means no engine timeout")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("prepare rewrites the launch into the shim carrying the streamed pipes-fallback ask", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-terminal-"))
+    try {
+      const desktop = await Effect.runPromise(
+        Effect.scoped(mxc.prepare(profile(root), { ...launch(root), stream: true } as unknown as Launch)),
+      )
+      const payload = JSON.parse(desktop.args[1] as string) as { stream?: boolean | undefined }
+      assert.equal(payload.stream, true, "the shim is told the run streams")
+      assert.match(desktop.command, /node(\.exe)?$/i)
+      assert.match(desktop.args[0] as string, /run-shim/, "every confined launch goes through the run-shim seam")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe("relaxation composition (ADR 0002)", () => {
   test("a read relaxation un-denies a credential store while the profile stays read-only", () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-relax-cred-"))
@@ -770,6 +812,60 @@ describe("mxc live enforcement (probe-gated)", () => {
     }
   })
 
+  test("a streamed pipes-fallback run forwards output live exactly once and completes identically", async (t) => {
+    const entry = await liveSdk(t)
+    if (!entry) return
+    const root = mkdtempSync(path.join(os.tmpdir(), "kilo-mxc-live-stream-"))
+    try {
+      const prepared = await Effect.runPromise(
+        Effect.scoped(
+          confine(liveProfile(root), {
+            command: "cmd",
+            // Note: `timeout /t` cannot provide the delay — it needs a console
+            // for the countdown and dies under the pipes fallback (itself a
+            // demonstration of TTY-dependent behaviour). ping's second echo
+            // request sleeps a headless second.
+            args: ["/c", "(echo L1) & (ping -n 2 127.0.0.1 >nul) & (echo L2) & exit /b 7"],
+            environment: { ...process.env },
+            stream: true,
+          }),
+        ),
+      )
+      const child = spawn(prepared.command, prepared.args, {
+        env: { ...process.env, KILO_MXC_SDK_ENTRY: entry },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      })
+      child.stdout.setEncoding("utf8")
+      let stdout = ""
+      const arrivals: Array<{ at: number; text: string }> = []
+      const started = Date.now()
+      child.stdout.on("data", (chunk: string) => {
+        // Only the shim's LIVE forwards may appear: with a streamed ask the
+        // captured result is never replayed, so each byte below arrived as
+        // the confined command produced it.
+        arrivals.push({ at: Date.now() - started, text: chunk })
+        stdout += chunk
+      })
+      let stderr = ""
+      child.stderr.setEncoding("utf8")
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk
+      })
+      const code = await new Promise<number | null>((resolve) => child.on("close", resolve))
+      const normalised = arrivals.map((entry) => entry.text.replace(/\r\n/g, "\n")).join("")
+      assert.equal(normalised, "L1\nL2\n", "output arrives live exactly once — never replayed at completion")
+      // Chunk coalescing across the process-pipe hop is scheduler-dependent
+      // (the SDK itself emits L1/L2 as separate events they reach this
+      // consumer read in ≥1 chunk), so only content and interleaving are
+      // asserted here; per-chunk liveness is pinned at the scripted seams.
+      assert.ok(arrivals.length >= 1)
+      assert.equal(code, 7, "completion semantics are identical to capture-mode")
+      assert.match(stderr, /\[kilo-mxc\] .*pip(e|es)/i, "the pipes-fallback degradation is signalled on the streamed run")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
   test("allows writes inside the granted workspace", async (t) => {
     const entry = await liveSdk(t)
     if (!entry) return
