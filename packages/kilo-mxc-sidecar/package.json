@@ -8,10 +8,12 @@
   "description": "Node sidecar hosting the MXC SDK behind an authenticated control channel for Kilo's Windows sandbox",
   "exports": {
     ".": "./src/index.ts",
-    "./run-shim": "./src/run-shim.ts"
+    "./run-shim": "./src/run-shim.ts",
+    "./unit/*": "./src/unit/*.ts"
   },
   "files": [
-    "src"
+    "src",
+    "script"
   ],
   "scripts": {
     "typecheck": "tsgo --noEmit",

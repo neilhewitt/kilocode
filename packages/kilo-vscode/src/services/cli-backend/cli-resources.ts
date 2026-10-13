@@ -11,6 +11,7 @@ const bwrapLicense = path.join("licenses", "bubblewrap")
 const bwrapLicenseFiles = ["NOTICE", "COPYING", "MUSL-COPYRIGHT", "build.ts"]
 const sandboxNetworkFiles = ["kilo-sandbox-network-relay.js", "kilo-sandbox-seccomp"]
 const sandboxRuntimeLicense = path.join("licenses", "sandbox-runtime")
+const mxcSidecarUnit = "mxc-sidecar-unit"
 
 function paths(file: string) {
   if (/^[a-z]:[\\/]/i.test(file) || file.includes("\\")) return path.win32
@@ -92,6 +93,23 @@ export async function copyKiloSandboxWorker(source: string, target: string): Pro
   const to = kiloSandboxWorkerForBinary(target)
   if (!fs.existsSync(from)) throw new Error(`Kilo sandbox mutation worker not found at ${from}`)
   await fs.promises.copyFile(from, to)
+}
+
+// The MXC sidecar unit ships beside the CLI binary in both distributions
+// (ADR 0005); the extension carries the identical directory so CLI and
+// extension surfaces consume the same versioned unit.
+export function hasMxcSidecarUnit(file: string): boolean {
+  const p = paths(file)
+  return fs.existsSync(path.join(p.dirname(file), mxcSidecarUnit, "manifest.json"))
+}
+
+export async function copyMxcSidecarUnit(source: string, target: string): Promise<void> {
+  const p = paths(source)
+  const from = p.join(p.dirname(source), mxcSidecarUnit)
+  const to = paths(target).join(paths(target).dirname(target), mxcSidecarUnit)
+  if (!fs.existsSync(p.join(from, "manifest.json"))) return
+  await fs.promises.rm(to, { recursive: true, force: true })
+  await fs.promises.cp(from, to, { recursive: true })
 }
 
 function cacheRoot() {
