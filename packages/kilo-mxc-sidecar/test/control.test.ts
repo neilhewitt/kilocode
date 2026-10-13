@@ -13,6 +13,10 @@ function scripted(): Runtime {
       availableMethods: ["processcontainer", "hyperlight"],
       isolationTier: "base-container",
     }),
+    run: async () => ({
+      wait: () => Promise.resolve({ exitCode: 0, stdout: "", stderr: "", timedOut: false, warnings: [] }),
+      kill: () => {},
+    }),
   }
 }
 

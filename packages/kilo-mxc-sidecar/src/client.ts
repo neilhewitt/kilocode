@@ -3,6 +3,7 @@ import net from "node:net"
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { generateToken } from "./auth.ts"
+import type { RunCommand, RunResult } from "./run.ts"
 
 // Driver-side client: what the agent core uses to own a sidecar process. Plain
 // Node-compatible APIs only, so it runs identically under the Bun-compiled agent
@@ -22,6 +23,7 @@ export type Sidecar = {
   exitCode: number | null
   handshake: () => Promise<Handshake>
   platformSupport: () => Promise<Record<string, unknown>>
+  run: (command: RunCommand) => Promise<RunResult>
   shutdown: () => Promise<void>
   stop: () => void
   orphan: () => void
@@ -124,6 +126,7 @@ export async function startSidecar(options: StartOptions = {}): Promise<Sidecar>
     },
     handshake: () => call<Handshake>("handshake", { token }),
     platformSupport: () => call<Record<string, unknown>>("platformSupport"),
+    run: (command: RunCommand) => call<RunResult>("run", { run: command }),
     shutdown: async () => {
       await call("shutdown")
       await new Promise<void>((resolve) => {

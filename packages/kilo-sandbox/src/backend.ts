@@ -2,6 +2,7 @@ import { Effect, PlatformError, Scope } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { bubblewrap } from "./bubblewrap"
 import { current } from "./context"
+import { mxc } from "./mxc"
 import { assertProcessNetwork, networkEnvironment } from "./network"
 import type { Profile } from "./profile"
 import { seatbelt } from "./seatbelt"
@@ -36,14 +37,14 @@ function unavailable(reason: string): Backend {
   }
 }
 
-function select(): Backend {
-  switch (process.platform) {
+export function select(platform: NodeJS.Platform = process.platform): Backend {
+  switch (platform) {
     case "darwin":
       return seatbelt
     case "linux":
       return bubblewrap
     case "win32":
-      return unavailable("The Windows sandbox backend is not available")
+      return mxc
     default:
       return unavailable("No sandbox backend is available for this operating system")
   }

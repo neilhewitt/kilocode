@@ -9,6 +9,7 @@ export {
   type Request,
   type Response,
 } from "./protocol.ts"
+export { isRunCommand, type RunCommand, type RunEgress, type RunHandle, type RunResult } from "./run.ts"
 export { createControlServer, type ControlOptions, type ControlServer } from "./control.ts"
-export { defaultRuntime, runtimeFromEnvironment, sdkEnv, TELEMETRY_KEY_PATTERN, type Runtime } from "./sdk.ts"
+export { defaultRuntime, runThrough, runtimeFromEnvironment, sdkEnv, toSdkRequest, TELEMETRY_KEY_PATTERN, type Runtime } from "./sdk.ts"
 export { ControlError, startSidecar, type Handshake, type Sidecar, type StartOptions } from "./client.ts"

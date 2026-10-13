@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, rmSync } from "node:fs"
 import { dirname } from "node:path"
 import { tokensMatch } from "./auth.ts"
 import { PROTOCOL_VERSION, error, isRequest, ok, type Request, type Response } from "./protocol.ts"
+import { isRunCommand, type RunHandle } from "./run.ts"
 import type { Runtime } from "./sdk.ts"
 
 // The control-channel server. Each connection is a fresh NDJSON exchange: the
@@ -15,6 +16,7 @@ export type ControlServer = {
   close: () => Promise<void>
   stop: () => Promise<void>
   onShutdown: (handler: () => Promise<void>) => void
+  killAll: () => void
 }
 
 export type ControlOptions = {
@@ -31,13 +33,48 @@ export function createControlServer(options: ControlOptions): ControlServer {
   const { runtime, endpoint, token } = options
   let shutdownHandler: (() => Promise<void>) | undefined
   const connections = new Set<net.Socket>()
+  // Live executions started by each connection. A connection going away mid-run
+  // must not leave a confined command running unowned inside the sidecar.
+  const activeRuns = new Map<net.Socket, Set<RunHandle>>()
 
-  const handle = async (socket: net.Socket, request: Request): Promise<void> => {
+  const active = (socket: net.Socket) => {
+    let runs = activeRuns.get(socket)
+    if (!runs) {
+      runs = new Set()
+      activeRuns.set(socket, runs)
+    }
+    return runs
+  }
+
+  const handle = async (socket: net.Socket, request: Request & { run?: unknown }): Promise<void> => {
     if (request.method === "platformSupport") {
       try {
         await respond(socket, ok(request.id, await runtime.getPlatformSupport()))
       } catch (cause) {
         await respond(socket, error(request.id, "internal_error", cause instanceof Error ? cause.message : String(cause)))
+      }
+      return
+    }
+    if (request.method === "run") {
+      if (!isRunCommand(request.run)) {
+        await respond(socket, error(request.id, "invalid_request", "run requires a valid command payload"))
+        return
+      }
+      let execution: RunHandle
+      try {
+        execution = await runtime.run(request.run)
+      } catch (cause) {
+        await respond(socket, error(request.id, "internal_error", cause instanceof Error ? cause.message : String(cause)))
+        return
+      }
+      const runs = active(socket)
+      runs.add(execution)
+      try {
+        await respond(socket, ok(request.id, await execution.wait()))
+      } catch (cause) {
+        await respond(socket, error(request.id, "internal_error", cause instanceof Error ? cause.message : String(cause)))
+      } finally {
+        runs.delete(execution)
       }
       return
     }
@@ -54,7 +91,14 @@ export function createControlServer(options: ControlOptions): ControlServer {
     let buffer = ""
     let authorised = false
     connections.add(socket)
-    socket.once("close", () => connections.delete(socket))
+    socket.once("close", () => {
+      connections.delete(socket)
+      const runs = activeRuns.get(socket)
+      if (runs) {
+        for (const execution of runs) execution.kill()
+        activeRuns.delete(socket)
+      }
+    })
     socket.setEncoding("utf8")
     socket.on("data", (chunk: string) => {
       buffer += chunk
@@ -132,6 +176,11 @@ export function createControlServer(options: ControlOptions): ControlServer {
     },
     onShutdown: (handler) => {
       shutdownHandler = handler
+    },
+    killAll: () => {
+      for (const runs of activeRuns.values()) {
+        for (const execution of runs) execution.kill()
+      }
     },
   }
 }

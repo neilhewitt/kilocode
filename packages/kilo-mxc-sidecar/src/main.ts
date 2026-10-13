@@ -26,7 +26,12 @@ await server.listen()
 process.stdout.write(
   JSON.stringify({ ready: true, channel: "control", endpoint: server.endpoint, protocol: PROTOCOL_VERSION, pid: process.pid }) + "\n",
 )
-// The parent holds stdin; when it goes away the sidecar must not linger.
+// The parent holds stdin; when it goes away the sidecar must not linger — and
+// any confined command it is still running must not outlive its caller.
+const farewell = () => {
+  server.killAll()
+  void server.stop().then(() => process.exit(0))
+}
 process.stdin.resume()
-process.stdin.on("close", () => process.exit(0))
-process.stdin.on("end", () => process.exit(0))
+process.stdin.on("close", farewell)
+process.stdin.on("end", farewell)
